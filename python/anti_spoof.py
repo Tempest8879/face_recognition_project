@@ -104,7 +104,7 @@ class MovementDetector:
     Measures non-rigid motion: real faces have independent eye/nose/chin movement,
     while photos held by hand show only rigid (global) motion.
     """
-
+ 
     def __init__(self, movement_threshold=0.002, history_size=15):
         self.movement_threshold = movement_threshold
         self.history_size = history_size

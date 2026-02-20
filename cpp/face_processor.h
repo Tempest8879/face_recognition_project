@@ -21,7 +21,7 @@ struct FaceMatch {
     double distance;
     double confidence;
 };
-
+ 
 class FaceProcessor {
 public:
     // Store a known face encoding with a name

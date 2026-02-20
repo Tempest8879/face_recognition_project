@@ -9,7 +9,7 @@ class FaceLocation:
     left: int
     def __init__(self) -> None: ...
     def __repr__(self) -> str: ...
-
+ 
 class FaceMatch:
     name: str
     distance: float

@@ -96,7 +96,7 @@ class FaceRecognitionApp:
         """Detect faces using MTCNN. Falls back to dlib HOG (fast)."""
         if self.mtcnn is None:
             return face_recognition.face_locations(rgb_frame)
-
+ 
         try:
             boxes, probs = self.mtcnn.detect(rgb_frame)
 
