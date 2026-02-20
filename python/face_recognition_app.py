@@ -88,7 +88,7 @@ class FaceRecognitionApp:
         # Anti-spoofing with challenge-response
         if ANTI_SPOOF_AVAILABLE:
             self.anti_spoof = AntiSpoofing()
-            print("[OK] Anti-spoofing initialized (blink + movement + mouth + challenge)")
+            print("[OK] Anti-spoofing initialized (Gate1: photo → Gate2: video)")
         else:
             self.anti_spoof = None
 
@@ -186,6 +186,7 @@ class FaceRecognitionApp:
         lock = threading.Lock()
         stop_event = threading.Event()
         start_challenge = threading.Event()
+        face_present_last_frame = [False]
 
         captured_frame = [None]            # latest camera frame
         face_results_shared = []           # list of (match_dict, (t,r,b,l))
@@ -233,6 +234,35 @@ class FaceRecognitionApp:
                     
                     # Detection on 1/4 res
                     locs = self._detect_faces_mtcnn(rgb_small)
+
+                    # 1. Detection on 1/4 res
+                    frame_small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+                    rgb_small = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
+                    rgb_small = np.ascontiguousarray(rgb_small) # Fixes your previous TypeError
+
+                    locs = self._detect_faces_mtcnn(rgb_small)
+                    
+                    # 2. FACE TRACKING
+                    num_faces = len(locs)
+                    has_face_now = num_faces > 0
+
+                    # Reset anti-spoof when face reappears after leaving
+                    if has_face_now and not face_present_last_frame[0]:
+                        if self.anti_spoof:
+                            self.anti_spoof.reset()
+                            print("[AUTO] New face detected. Liveness check started.")
+
+                    # 3. MULTI-FACE PAUSE: halt challenge if >1 face
+                    if self.anti_spoof and self.anti_spoof.challenge_active():
+                        if num_faces > 1 and not self.anti_spoof.challenge_paused():
+                            print("[WARN] Multiple faces detected! Pausing challenge...")
+                            self.anti_spoof.pause_challenge()
+                        elif num_faces == 1 and self.anti_spoof.challenge_paused():
+                            print("[INFO] Single face restored. Resuming challenge...")
+                            self.anti_spoof.unpause_challenge()
+
+                    face_present_last_frame[0] = has_face_now
+
                     encs = face_recognition.face_encodings(rgb_small, locs)
 
                     new_results = []
@@ -332,8 +362,13 @@ class FaceRecognitionApp:
 
                 label = f"{match['name']} ({match['confidence']:.0%})"
                 if self.anti_spoof and display_spoof:
-                    status = "LIVE" if display_is_live else "SPOOF"
-                    label += f" [{status} {display_spoof['liveness_score']:.0%}]"
+                    if display_is_live:
+                        status = "LIVE"
+                    elif display_spoof.get('photo_passed'):
+                        status = "CHECKING VIDEO"
+                    else:
+                        status = "CHECKING LIVENESS"
+                    label += f" [{status}]"
 
                 cv2.putText(frame, label, (left, max(top - 10, 20)),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
@@ -341,18 +376,40 @@ class FaceRecognitionApp:
             # --- HUD overlay ---
             if self.anti_spoof and display_spoof:
                 y = 25
+                # Gate 1 — Photo / Liveness
+                photo_ok = display_spoof.get('photo_passed', False)
+                g1_color = (0, 255, 0) if photo_ok else (0, 0, 255)
+                cv2.putText(frame, f"PHOTO  {'PASS' if photo_ok else 'FAIL'} {display_spoof.get('photo_score', 0):.2f}",
+                           (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, g1_color, 1)
+                y += 18
                 for text in (
-                    f"Blink: {display_spoof['blink_signal']:.2f}",
-                    f"Movement: {display_spoof['movement_signal']:.2f}",
-                    f"Mouth: {display_spoof.get('mouth_signal', 0):.2f}",
-                    f"Challenge: {display_spoof.get('challenge_signal', 0):.2f}",
-                    f"EAR: {display_spoof['ear']:.2f}",
-                    f"MAR: {display_spoof.get('mar', 0):.2f}",
-                    f"Liveness: {display_spoof['liveness_score']:.2f}",
+                    f"  Blink: {display_spoof['blink_signal']:.2f}",
+                    f"  Mouth: {display_spoof.get('mouth_signal', 0):.2f}",
+                    f"  Move:  {display_spoof['movement_signal']:.2f}",
                 ):
                     cv2.putText(frame, text, (10, y),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-                    y += 20
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 255), 1)
+                    y += 16
+
+                # Gate 2 — Video
+                video_ok = display_spoof.get('video_passed', False)
+                g2_color = (0, 255, 0) if video_ok else (0, 0, 255)
+                cv2.putText(frame, f"VIDEO  {'PASS' if video_ok else 'FAIL'} {display_spoof.get('video_score', 0):.2f}",
+                           (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, g2_color, 1)
+                y += 18
+                for text in (
+                    f"  Chall: {display_spoof.get('challenge_signal', 0):.2f}",
+                    f"  Screen:{display_spoof.get('screen_signal', 1.0):.2f}",
+                    f"  Depth: {display_spoof.get('consistency_score', 0):.2f}",
+                ):
+                    cv2.putText(frame, text, (10, y),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 255), 1)
+                    y += 16
+
+                # Combined
+                cv2.putText(frame, f"LIVE: {display_spoof['liveness_score']:.2f}",
+                           (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+                           (0, 255, 0) if display_is_live else (0, 0, 255), 1)
 
                 cr = display_spoof.get('challenge_result')
                 if cr:
@@ -386,7 +443,23 @@ class FaceRecognitionApp:
         """Draw challenge-response status on frame."""
         h, w = frame.shape[:2]
 
-        if cr['is_active'] and cr['current_challenge']:
+        if cr.get('paused') and cr['is_active']:
+            # --- Paused: multiple faces detected ---
+            progress = f"{cr['challenges_passed']}/{cr['num_challenges']}"
+
+            roi = frame[h - 80:h, 0:w]
+            cv2.addWeighted(roi, 0.3, roi, 0, 0, roi)
+
+            warn_text = "PAUSED - Multiple faces detected"
+            text_size = cv2.getTextSize(warn_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            text_x = (w - text_size[0]) // 2
+            cv2.putText(frame, warn_text, (text_x, h - 45),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(frame, f"Challenge {progress} | Waiting for single face...",
+                       (text_x, h - 15),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        elif cr['is_active'] and cr['current_challenge']:
             instruction = cr['current_instruction']
             progress = f"{cr['challenges_passed']}/{cr['num_challenges']}"
             timer = f"{cr['time_remaining']:.1f}s"
