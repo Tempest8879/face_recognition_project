@@ -220,6 +220,10 @@ class FaceRecognitionApp:
                         worker_busy[0] = True
 
                 if frame is None:
+                    time.sleep(0.003)
+                    continue
+
+                try:
                     # Resize or slice first
                     frame_small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
                     
@@ -227,41 +231,34 @@ class FaceRecognitionApp:
                     rgb_small = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
                     rgb_small = np.ascontiguousarray(rgb_small) 
                     
-                    # This will now match the expected dlib function signature
+                    # Detection on 1/4 res
+                    locs = self._detect_faces_mtcnn(rgb_small)
                     encs = face_recognition.face_encodings(rgb_small, locs)
-                    time.sleep(0.003)
-                    continue
 
-                # Detection on 1/4 res
-                small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
-                rgb_small = small[:, :, ::-1]  # BGR->RGB without copy
+                    new_results = []
+                    for enc, loc in zip(encs, locs):
+                        match = self._match_face(enc)
+                        t, r, b, l = [v * 4 for v in loc]
+                        new_results.append((match, (t, r, b, l)))
 
-                locs = self._detect_faces_mtcnn(rgb_small)
-                encs = face_recognition.face_encodings(rgb_small, locs)
-
-                new_results = []
-                for enc, loc in zip(encs, locs):
-                    match = self._match_face(enc)
-                    t, r, b, l = [v * 4 for v in loc]
-                    new_results.append((match, (t, r, b, l)))
-
-                # Anti-spoofing with dlib landmarks on full-res
-                new_spoof = None
-                if self.anti_spoof and new_results:
-                    _, first_loc = new_results[0]
-                    rgb_full = frame[:, :, ::-1]  # BGR->RGB without copy
-                    lm_list = face_recognition.face_landmarks(
-                        rgb_full, face_locations=[first_loc]
-                    )
-                    lm_dict = lm_list[0] if lm_list else None
-                    new_spoof = self.anti_spoof.evaluate(
-                        frame, first_loc, lm_dict
-                    )
-
-                with lock:
-                    face_results_shared[:] = new_results
-                    spoof_result_shared[0] = new_spoof
-                    worker_busy[0] = False
+                    # Anti-spoofing with dlib landmarks on full-res
+                    new_spoof = None
+                    if self.anti_spoof and new_results:
+                        _, first_loc = new_results[0]
+                        rgb_full = frame[:, :, ::-1]  # BGR->RGB without copy
+                        lm_list = face_recognition.face_landmarks(
+                            rgb_full, face_locations=[first_loc]
+                        )
+                        lm_dict = lm_list[0] if lm_list else None
+                        new_spoof = self.anti_spoof.evaluate(
+                            frame, first_loc, lm_dict
+                        )
+                    
+                finally:
+                    with lock:
+                        face_results_shared[:] = new_results
+                        spoof_result_shared[0] = new_spoof
+                        worker_busy[0] = False
 
         # Start threads
         threading.Thread(target=_capture, daemon=True).start()
