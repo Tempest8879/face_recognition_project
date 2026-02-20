@@ -115,7 +115,8 @@ def main():
     try:
         from anti_spoof import (
             AntiSpoofing, BlinkDetector, MovementDetector,
-            MouthMovementDetector, ChallengeResponseDetector
+            MouthMovementDetector, ChallengeResponseDetector,
+            ScreenDetector
         )
         print(f"  [PASS] anti_spoof module imports successfully")
 
@@ -154,18 +155,59 @@ def main():
         assert 0.0 <= signal <= 1.0
         print(f"  [PASS] MouthMovementDetector.update -> signal={signal:.2f}")
 
-        # Test ChallengeResponseDetector
-        crd = ChallengeResponseDetector(num_challenges=2, challenge_timeout=5.0)
+        # Test ScreenDetector with synthetic images
+        sd = ScreenDetector()
+        # Random noise = organic texture (should score higher = "real")
+        rng = np.random.RandomState(42)
+        random_frame = rng.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+        sig_random = sd.update(random_frame, (0, 100, 100, 0))
+        # Repeating stripe pattern = screen-like (should score lower)
+        stripe_row = np.tile(np.array([0, 255] * 50, dtype=np.uint8), (1, 1))
+        stripe_frame = np.tile(stripe_row, (100, 1))
+        stripe_frame = np.stack([stripe_frame] * 3, axis=-1)
+        sd_stripe = ScreenDetector()
+        sig_stripe = sd_stripe.update(stripe_frame, (0, 100, 100, 0))
+        assert 0.0 <= sig_random <= 1.0
+        assert 0.0 <= sig_stripe <= 1.0
+        print(f"  [PASS] ScreenDetector -> random={sig_random:.2f} stripe={sig_stripe:.2f}")
+
+        sd.reset()
+        assert len(sd.score_history) == 0
+        print(f"  [PASS] ScreenDetector.reset works")
+
+        # Test ChallengeResponseDetector (head-pose + 3D consistency)
+        crd = ChallengeResponseDetector(num_challenges=4, challenge_timeout=10.0)
         assert not crd.is_active
         crd.start()
         assert crd.is_active
         result = crd.get_result()
         assert result['is_active']
-        assert result['current_challenge'] is not None
+        assert result['current_challenge'] == 'TURN_LEFT'
+        assert 'consistency_score' in result
+        assert 'euc_lr' in result and 'cos_lr' in result
         print(f"  [PASS] ChallengeResponseDetector.start -> challenge={result['current_challenge']}")
+
+        # Test pause/unpause (multi-face handling)
+        crd.pause()
+        assert crd._paused
+        result = crd.get_result()
+        assert result['paused']
+        assert result['is_active']  # still active, just paused
+        # update() should be a no-op while paused
+        result_paused = crd.update(fake_lm)
+        assert result_paused['paused']
+        print(f"  [PASS] ChallengeResponseDetector.pause -> paused={crd._paused}")
+
+        crd.unpause()
+        assert not crd._paused
+        assert crd.is_active
+        assert crd.challenge_start_time is not None  # timer restarted
+        print(f"  [PASS] ChallengeResponseDetector.unpause -> resumed")
 
         crd.reset()
         assert not crd.is_active
+        assert not crd._paused
+        assert crd._consistency_score == 0.0
         print(f"  [PASS] ChallengeResponseDetector.reset works")
 
         # Test AntiSpoofing construction

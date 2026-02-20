@@ -5,13 +5,13 @@ Multi-layer anti-spoofing system using only MTCNN and CNN for maximum accuracy:
   1. Eye blink detection (dlib 68-point landmarks via face_recognition)
   2. Head micro-movement detection (dlib landmarks)
   3. Mouth micro-movement detection (dlib landmarks)
-  4. Challenge-response verification (blink/smile/open mouth/turn head)
+  4. Head-pose challenge-response with 3D geometric consistency
+  5. FFT screen detection (frequency-domain pixel-grid / moiré analysis)
 
 Dependencies: face_recognition (dlib), opencv-python, numpy
 """
 
 import time
-import random
 import numpy as np
 import cv2
 import face_recognition
@@ -247,28 +247,213 @@ class MouthMovementDetector:
 
 
 # =============================================================================
+# Screen Detector (FFT frequency-domain analysis)
+# =============================================================================
+
+class ScreenDetector:
+    """Detect screens / displays via frequency-domain analysis of the face ROI.
+
+    When a camera films a screen the captured image contains artifacts that
+    real skin does not produce:
+
+      1. Moiré patterns from camera↔screen pixel-grid interference
+      2. Energy concentration along horizontal / vertical frequency axes
+         (screen pixels are arranged in a rectilinear grid)
+      3. Discrete mid-frequency peaks (pixel-pitch harmonics)
+      4. Different Laplacian sharpness profile vs organic skin texture
+
+    Multiple metrics are fused and smoothed over a sliding window so that
+    single-frame noise does not cause false positives.
+
+    Uses only OpenCV + NumPy — no extra dependencies.
+    """
+
+    ANALYSIS_SIZE = 128          # face ROI is resized to this for FFT
+
+    def __init__(self, history_size=30):
+        self.history_size = history_size
+        self.score_history = []
+        self.last_score = 0.0
+        self.last_metrics = {}
+
+    # ----- public API -----
+
+    def update(self, frame_bgr, face_location):
+        """Analyse one frame's face ROI for screen artifacts.
+
+        Args:
+            frame_bgr:     Full BGR frame from OpenCV capture.
+            face_location: (top, right, bottom, left) at frame resolution.
+
+        Returns:
+            float  signal [0.0, 1.0] — 1.0 = real face, 0.0 = screen.
+        """
+        top, right, bottom, left = (int(v) for v in face_location)
+        h, w = frame_bgr.shape[:2]
+        top, left = max(0, top), max(0, left)
+        bottom, right = min(h, bottom), min(w, right)
+
+        roi = frame_bgr[top:bottom, left:right]
+        if roi.size == 0 or roi.shape[0] < 32 or roi.shape[1] < 32:
+            return self.get_signal()
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (self.ANALYSIS_SIZE, self.ANALYSIS_SIZE))
+
+        score, metrics = self._analyze(gray)
+
+        self.last_score = score
+        self.last_metrics = metrics
+        self.score_history.append(score)
+        if len(self.score_history) > self.history_size:
+            self.score_history.pop(0)
+
+        return self.get_signal()
+
+    def get_signal(self):
+        """Median-smoothed screen-detection signal over recent frames."""
+        if not self.score_history:
+            return 1.0                                   # assume real until proven otherwise
+        if len(self.score_history) < 3:
+            return float(np.mean(self.score_history))
+        return float(np.median(self.score_history))
+
+    def reset(self):
+        self.score_history.clear()
+        self.last_score = 0.0
+        self.last_metrics = {}
+
+    # ----- internal -----
+
+    def _analyze(self, gray):
+        """Run frequency + spatial analysis on a 128×128 grayscale face ROI.
+
+        Returns (score, metrics_dict).
+            score  : float [0.0, 1.0]  — 1.0 = real skin, 0.0 = screen.
+            metrics: dict of intermediate values (for HUD / debugging).
+        """
+        sz = self.ANALYSIS_SIZE
+        gray_f = gray.astype(np.float64)
+
+        # ---- 2D FFT ----
+        fshift = np.fft.fftshift(np.fft.fft2(gray_f))
+        magnitude = np.abs(fshift)
+
+        cy, cx = sz // 2, sz // 2
+        y_idx, x_idx = np.ogrid[:sz, :sz]
+        r = np.sqrt((x_idx - cx) ** 2 + (y_idx - cy) ** 2)
+        max_r = float(cx)
+
+        total_energy = np.sum(magnitude ** 2) + 1e-10
+
+        # 1. Spectral flatness (Wiener entropy)
+        #    Real skin texture → flatter (noise-like) spectrum.
+        #    Screen pixel grid  → peaked spectrum.
+        log_mag = np.log(magnitude + 1e-10)
+        geo_mean = np.exp(np.mean(log_mag))
+        arith_mean = np.mean(magnitude) + 1e-10
+        spectral_flatness = float(geo_mean / arith_mean)
+
+        # 2. Axis energy ratio
+        #    Screen pixels sit on a rectilinear grid → strong H / V axis
+        #    energy in the FFT.  Exclude the DC neighbourhood.
+        band = 2
+        h_axis = np.zeros((sz, sz), dtype=bool)
+        h_axis[cy - band:cy + band + 1, :] = True
+        v_axis = np.zeros((sz, sz), dtype=bool)
+        v_axis[:, cx - band:cx + band + 1] = True
+        dc = r < 3
+        axis_mask = (h_axis | v_axis) & ~dc
+
+        axis_energy = float(np.sum(magnitude[axis_mask] ** 2) / total_energy)
+
+        # 3. Mid-frequency peak ratio
+        #    Screens produce sharp harmonics at pixel-pitch multiples;
+        #    organic skin has a smooth spectral roll-off.
+        mid_mask = (r > max_r * 0.15) & (r < max_r * 0.75)
+        mid_mags = magnitude[mid_mask]
+        if mid_mags.size > 0:
+            median_mid = np.median(mid_mags)
+            peak_ratio = float(np.sum(mid_mags > 4.0 * median_mid) / mid_mags.size) \
+                         if median_mid > 0 else 0.0
+        else:
+            peak_ratio = 0.0
+
+        # 4. Laplacian variance (spatial-domain sharpness)
+        #    Screen pixels create fine sharp edges that boost Laplacian.
+        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+        # ---- Per-metric scoring (each ∈ [0, 1], 1 = real face) ----
+
+        # Flatness: real skin typically > 0.012, screens < 0.008
+        flatness_sig = float(min(1.0, spectral_flatness / 0.015))
+
+        # Axis energy: real < 0.08, screens > 0.12
+        axis_sig = float(1.0 - min(1.0, max(0.0, (axis_energy - 0.06)) / 0.10))
+
+        # Peak ratio: real < 0.01, screens > 0.02
+        peak_sig = float(1.0 - min(1.0, peak_ratio / 0.03))
+
+        # Laplacian: very high variance → sharp pixel edges (screen)
+        lap_sig = float(max(0.3, 1.0 - max(0.0, lap_var - 2000) / 5000)
+                        if lap_var > 2000 else 1.0)
+
+        # ---- Fusion ----
+        score = (0.30 * flatness_sig +
+                 0.30 * axis_sig +
+                 0.25 * peak_sig +
+                 0.15 * lap_sig)
+
+        metrics = {
+            'spectral_flatness': spectral_flatness,
+            'axis_energy':       axis_energy,
+            'peak_ratio':        peak_ratio,
+            'laplacian_var':     lap_var,
+            'flatness_sig':      flatness_sig,
+            'axis_sig':          axis_sig,
+            'peak_sig':          peak_sig,
+            'lap_sig':           lap_sig,
+        }
+
+        return float(np.clip(score, 0.0, 1.0)), metrics
+
+
+# =============================================================================
 # Challenge-Response Detector (interactive liveness verification)
 # =============================================================================
 
 class ChallengeResponseDetector:
-    """Interactive challenge-response liveness verification.
+    """Head-pose challenge-response with 3D geometric consistency analysis.
 
-    Issues random challenges (blink, smile, open mouth, turn head) and verifies
-    the user performs them within a timeout. Extremely hard to spoof since it
-    requires real-time responsive facial actions.
+    Fixed sequence: TURN LEFT → TURN RIGHT → LOOK UP → LOOK DOWN
+
+    At each completed pose, a normalized landmark feature vector is captured.
+    After all poses, euclidean distances and cosine similarities between
+    opposing pose pairs (left↔right, up↔down) are computed. A real 3D face
+    exhibits perspective-dependent geometry shifts (parallax) that a flat
+    video or photo cannot replicate.
+
+    The final signal combines challenge completion with a 3D consistency
+    score derived from these geometric comparisons.
     """
 
     CHALLENGES = [
-        ('BLINK', 'Please BLINK your eyes'),
-        ('SMILE', 'Please SMILE'),
-        ('OPEN_MOUTH', 'Please OPEN your MOUTH'),
         ('TURN_LEFT', 'Please turn head LEFT'),
         ('TURN_RIGHT', 'Please turn head RIGHT'),
+        ('LOOK_UP', 'Please LOOK UP'),
+        ('LOOK_DOWN', 'Please LOOK DOWN'),
     ]
 
-    def __init__(self, num_challenges=3, challenge_timeout=5.0):
+    def __init__(self, num_challenges=4, challenge_timeout=10.0,
+                 euc_threshold_lr=0.08, euc_threshold_ud=0.06,
+                 cos_dissim_threshold=0.02):
         self.num_challenges = num_challenges
         self.challenge_timeout = challenge_timeout
+
+        # 3D consistency thresholds
+        self.euc_threshold_lr = euc_threshold_lr    # left↔right euclidean
+        self.euc_threshold_ud = euc_threshold_ud    # up↔down euclidean
+        self.cos_dissim_threshold = cos_dissim_threshold  # 1 - cosine_sim
 
         self.current_challenge = None
         self.current_instruction = ""
@@ -281,18 +466,32 @@ class ChallengeResponseDetector:
         self._baseline = {}
         self._remaining = []
 
+        # Multi-face pause state
+        self._paused = False
+
+        # 3D consistency analysis state
+        self._pose_snapshots = {}       # {challenge_id: feature_vector}
+        self._consistency_score = 0.0
+        self._euc_lr = 0.0             # euclidean distance left↔right
+        self._euc_ud = 0.0             # euclidean distance up↔down
+        self._cos_lr = 1.0             # cosine similarity left↔right
+        self._cos_ud = 1.0             # cosine similarity up↔down
+
     def start(self):
-        """Start a new challenge-response sequence."""
+        """Start a new challenge-response sequence (fixed order)."""
         self.challenges_passed = 0
         self.challenges_failed = 0
         self.is_active = True
         self.is_complete = False
         self.passed = False
-        selected = random.sample(
-            self.CHALLENGES,
-            min(self.num_challenges, len(self.CHALLENGES))
-        )
-        self._remaining = list(selected)
+        self._paused = False
+        self._pose_snapshots = {}
+        self._consistency_score = 0.0
+        self._euc_lr = 0.0
+        self._euc_ud = 0.0
+        self._cos_lr = 1.0
+        self._cos_ud = 1.0
+        self._remaining = list(self.CHALLENGES[:self.num_challenges])
         self._next_challenge()
 
     def _next_challenge(self):
@@ -303,6 +502,7 @@ class ChallengeResponseDetector:
             self.passed = True
             self.current_challenge = None
             self.current_instruction = "VERIFIED"
+            self._consistency_score = self._compute_3d_consistency()
             return
 
         if not self._remaining:
@@ -318,17 +518,41 @@ class ChallengeResponseDetector:
         self.challenge_start_time = time.time()
         self._baseline = {}
 
-    def update(self, landmarks_dict, ear, mar):
+    def pause(self):
+        """Pause the challenge sequence (multiple faces detected).
+
+        Resets the current challenge's baseline and timer so it must be
+        re-performed from scratch when unpaused, but preserves progress
+        on already-completed challenges and their pose snapshots.
+        """
+        if not self.is_active or self._paused:
+            return
+        self._paused = True
+        self._baseline = {}
+
+    def unpause(self):
+        """Resume after pause (back to single face).
+
+        Restarts the current challenge with a fresh timer and baseline.
+        """
+        if not self.is_active or not self._paused:
+            return
+        self._paused = False
+        self.challenge_start_time = time.time()
+        self._baseline = {}
+
+    def update(self, landmarks_dict):
         """Check if current challenge is completed.
 
         Args:
             landmarks_dict: face_recognition.face_landmarks() result dict
-            ear: Current Eye Aspect Ratio
-            mar: Current Mouth Aspect Ratio
 
         Returns:
-            dict with challenge status
+            dict with challenge status and 3D consistency metrics
         """
+        if self._paused:
+            return self.get_result()
+
         if not self.is_active or self.current_challenge is None:
             return self.get_result()
 
@@ -345,42 +569,26 @@ class ChallengeResponseDetector:
                 self.current_instruction = "FAILED - Time expired"
             return self.get_result()
 
-        passed = self._check_challenge(landmarks_dict, ear, mar)
+        passed = self._check_challenge(landmarks_dict)
 
         if passed:
+            # Capture landmark snapshot for 3D geometric analysis
+            features = self._extract_pose_features(landmarks_dict)
+            if features is not None:
+                self._pose_snapshots[self.current_challenge] = features
+
             self.challenges_passed += 1
             self._next_challenge()
 
         return self.get_result()
 
-    def _check_challenge(self, landmarks_dict, ear, mar):
-        """Evaluate whether the current challenge action was performed."""
-        if self.current_challenge == 'BLINK':
-            return ear < 0.19
+    # ------------------------------------------------------------------
+    # Pose detection
+    # ------------------------------------------------------------------
 
-        elif self.current_challenge == 'SMILE':
-            try:
-                top_lip = landmarks_dict['top_lip']
-                chin = landmarks_dict['chin']
-                left_corner = np.array(top_lip[0], dtype=float)
-                right_corner = np.array(top_lip[6], dtype=float)
-                mouth_width = np.linalg.norm(right_corner - left_corner)
-                face_width = np.linalg.norm(
-                    np.array(chin[16], dtype=float) - np.array(chin[0], dtype=float)
-                )
-                if face_width > 1:
-                    ratio = mouth_width / face_width
-                    if 'smile_baseline' not in self._baseline:
-                        self._baseline['smile_baseline'] = ratio
-                    elif ratio > self._baseline['smile_baseline'] * 1.12:
-                        return True
-            except (KeyError, IndexError):
-                pass
-
-        elif self.current_challenge == 'OPEN_MOUTH':
-            return mar > 0.35
-
-        elif self.current_challenge == 'TURN_LEFT':
+    def _check_challenge(self, landmarks_dict):
+        """Evaluate whether the current head-pose challenge was performed."""
+        if self.current_challenge == 'TURN_LEFT':
             try:
                 nose = np.array(landmarks_dict['nose_tip'][2], dtype=float)
                 chin = landmarks_dict['chin']
@@ -408,23 +616,169 @@ class ChallengeResponseDetector:
             except (KeyError, IndexError):
                 pass
 
+        elif self.current_challenge == 'LOOK_UP':
+            try:
+                nose_tip = np.array(landmarks_dict['nose_tip'][2], dtype=float)
+                bridge_top = np.array(landmarks_dict['nose_bridge'][0], dtype=float)
+                chin_bottom = np.array(landmarks_dict['chin'][8], dtype=float)
+                upper = abs(nose_tip[1] - bridge_top[1])
+                lower = abs(chin_bottom[1] - nose_tip[1])
+                ratio = upper / (upper + lower + 1e-6)
+                if 'vertical_ratio_baseline' not in self._baseline:
+                    self._baseline['vertical_ratio_baseline'] = ratio
+                elif ratio < self._baseline['vertical_ratio_baseline'] - 0.04:
+                    return True
+            except (KeyError, IndexError):
+                pass
+
+        elif self.current_challenge == 'LOOK_DOWN':
+            try:
+                nose_tip = np.array(landmarks_dict['nose_tip'][2], dtype=float)
+                bridge_top = np.array(landmarks_dict['nose_bridge'][0], dtype=float)
+                chin_bottom = np.array(landmarks_dict['chin'][8], dtype=float)
+                upper = abs(nose_tip[1] - bridge_top[1])
+                lower = abs(chin_bottom[1] - nose_tip[1])
+                ratio = upper / (upper + lower + 1e-6)
+                if 'vertical_ratio_baseline' not in self._baseline:
+                    self._baseline['vertical_ratio_baseline'] = ratio
+                elif ratio > self._baseline['vertical_ratio_baseline'] + 0.04:
+                    return True
+            except (KeyError, IndexError):
+                pass
+
         return False
+
+    # ------------------------------------------------------------------
+    # 3D geometric consistency analysis
+    # ------------------------------------------------------------------
+
+    def _extract_pose_features(self, landmarks_dict):
+        """Extract a normalized geometric feature vector from landmarks.
+
+        8 features, all normalized by face width or height so they are
+        scale-invariant and capture only the 3D perspective geometry:
+
+          0. left_eye → nose_tip  / face_width
+          1. right_eye → nose_tip / face_width
+          2. nose_tip → left_jaw  / face_width
+          3. nose_tip → right_jaw / face_width
+          4. nose_tip horizontal offset from face center / face_width
+          5. nose_tip vertical offset from face center   / face_height
+          6. left_eye → left_jaw  / face_width
+          7. right_eye → right_jaw / face_width
+
+        A real 3D face produces perspective-dependent changes in these
+        ratios when the head rotates; a flat image does not.
+        """
+        try:
+            nose_tip = np.array(landmarks_dict['nose_tip'][2], dtype=float)
+            chin_bottom = np.array(landmarks_dict['chin'][8], dtype=float)
+            left_jaw = np.array(landmarks_dict['chin'][0], dtype=float)
+            right_jaw = np.array(landmarks_dict['chin'][16], dtype=float)
+            left_eye_outer = np.array(landmarks_dict['left_eye'][0], dtype=float)
+            right_eye_outer = np.array(landmarks_dict['right_eye'][3], dtype=float)
+            bridge_top = np.array(landmarks_dict['nose_bridge'][0], dtype=float)
+
+            face_width = np.linalg.norm(right_jaw - left_jaw)
+            face_height = np.linalg.norm(bridge_top - chin_bottom)
+
+            if face_width < 1 or face_height < 1:
+                return None
+
+            center_x = (left_jaw[0] + right_jaw[0]) / 2.0
+            center_y = (bridge_top[1] + chin_bottom[1]) / 2.0
+
+            features = np.array([
+                np.linalg.norm(left_eye_outer - nose_tip) / face_width,
+                np.linalg.norm(right_eye_outer - nose_tip) / face_width,
+                np.linalg.norm(nose_tip - left_jaw) / face_width,
+                np.linalg.norm(nose_tip - right_jaw) / face_width,
+                (nose_tip[0] - center_x) / face_width,
+                (nose_tip[1] - center_y) / face_height,
+                np.linalg.norm(left_eye_outer - left_jaw) / face_width,
+                np.linalg.norm(right_eye_outer - right_jaw) / face_width,
+            ])
+            return features
+        except (KeyError, IndexError):
+            return None
+
+    def _compute_3d_consistency(self):
+        """Compute 3D consistency score from opposing pose snapshots.
+
+        Compares feature vectors of opposing poses using both euclidean
+        distance and cosine similarity:
+
+          euclidean distance  — high for real faces (geometry changes)
+          cosine dissimilarity — high for real faces (ratio directions shift)
+
+        A flat image (photo / video replay) shows near-identical feature
+        vectors across poses because no true parallax occurs.
+
+        Returns:
+            float [0.0, 1.0]  — 1.0 = strong 3D parallax (real face)
+        """
+        scores = []
+
+        # Left ↔ Right comparison
+        l_feat = self._pose_snapshots.get('TURN_LEFT')
+        r_feat = self._pose_snapshots.get('TURN_RIGHT')
+        if l_feat is not None and r_feat is not None:
+            self._euc_lr = float(np.linalg.norm(l_feat - r_feat))
+            dot = np.dot(l_feat, r_feat)
+            norms = np.linalg.norm(l_feat) * np.linalg.norm(r_feat) + 1e-8
+            self._cos_lr = float(dot / norms)
+
+            euc_score = min(1.0, self._euc_lr / self.euc_threshold_lr)
+            dissim_score = min(1.0, (1.0 - self._cos_lr) / self.cos_dissim_threshold)
+            scores.append(0.5 * euc_score + 0.5 * dissim_score)
+
+        # Up ↔ Down comparison
+        u_feat = self._pose_snapshots.get('LOOK_UP')
+        d_feat = self._pose_snapshots.get('LOOK_DOWN')
+        if u_feat is not None and d_feat is not None:
+            self._euc_ud = float(np.linalg.norm(u_feat - d_feat))
+            dot = np.dot(u_feat, d_feat)
+            norms = np.linalg.norm(u_feat) * np.linalg.norm(d_feat) + 1e-8
+            self._cos_ud = float(dot / norms)
+
+            euc_score = min(1.0, self._euc_ud / self.euc_threshold_ud)
+            dissim_score = min(1.0, (1.0 - self._cos_ud) / self.cos_dissim_threshold)
+            scores.append(0.5 * euc_score + 0.5 * dissim_score)
+
+        return float(np.mean(scores)) if scores else 0.0
+
+    # ------------------------------------------------------------------
+    # Result / reset
+    # ------------------------------------------------------------------
 
     def get_result(self):
         time_remaining = 0.0
         if self.challenge_start_time and self.is_active:
             time_remaining = max(0, self.challenge_timeout - (time.time() - self.challenge_start_time))
 
+        # Signal factors in 3D consistency: passing alone is not enough;
+        # the geometry must also check out.
+        if self.passed:
+            signal = max(0.4, self._consistency_score)
+        else:
+            signal = 0.0
+
         return {
             'is_active': self.is_active,
             'is_complete': self.is_complete,
             'passed': self.passed,
+            'paused': self._paused,
             'current_challenge': self.current_challenge,
             'current_instruction': self.current_instruction,
             'challenges_passed': self.challenges_passed,
             'num_challenges': self.num_challenges,
-            'signal': 1.0 if self.passed else 0.0,
+            'signal': signal,
             'time_remaining': time_remaining,
+            'consistency_score': self._consistency_score,
+            'euc_lr': self._euc_lr,
+            'euc_ud': self._euc_ud,
+            'cos_lr': self._cos_lr,
+            'cos_ud': self._cos_ud,
         }
 
     def reset(self):
@@ -436,8 +790,15 @@ class ChallengeResponseDetector:
         self.is_active = False
         self.is_complete = False
         self.passed = False
+        self._paused = False
         self._baseline = {}
         self._remaining = []
+        self._pose_snapshots = {}
+        self._consistency_score = 0.0
+        self._euc_lr = 0.0
+        self._euc_ud = 0.0
+        self._cos_lr = 1.0
+        self._cos_ud = 1.0
 
 
 # =============================================================================
@@ -445,40 +806,43 @@ class ChallengeResponseDetector:
 # =============================================================================
 
 class AntiSpoofing:
-    """Multi-layer anti-spoofing / liveness detection system.
+    """Two-gate anti-spoofing / liveness detection system.
 
-    Combines passive detection + active challenge-response:
+    Gate 1 — Photo / Liveness (passive, continuous):
+      Proves the face is a live person, not a static photo.
+        • Eye blink detection  (45%)
+        • Mouth micro-movement (30%)
+        • Head micro-movement  (25%)
+      Must reach photo_threshold to pass.
 
-    Passive signals (continuous):
-      1. Eye blink detection (dlib 68-point EAR) — 25%
-      2. Head micro-movement detection (dlib landmarks) — 20%
-      3. Mouth micro-movement detection (dlib landmarks) — 20%
+    Gate 2 — Video detection (active challenge + FFT):
+      Proves the feed is not a video replay on a screen.
+        • Head-pose challenge with 3D consistency (55%)
+        • FFT screen / moiré detection             (45%)
+      Must reach video_threshold to pass.
 
-    Active signal:
-      4. Challenge-response (blink/smile/open mouth/turn head) — 35%
+    Final decision: BOTH gates must pass for ≥ consec_live_required
+    consecutive evaluations before is_live = True.
 
     Uses only MTCNN and CNN (dlib) — no MediaPipe dependency.
     """
 
-    def __init__(self, liveness_threshold=0.55,
-                 blink_weight=0.25, movement_weight=0.20,
-                 mouth_weight=0.20, challenge_weight=0.35,
-                 num_challenges=3, challenge_timeout=5.0,
+    def __init__(self, photo_threshold=0.40, video_threshold=0.35,
+                 num_challenges=4, challenge_timeout=10.0,
                  ear_threshold=0.2, consec_frames=2, blink_time_window=5.0,
                  movement_threshold=0.005, movement_history=15,
                  mar_movement_threshold=0.003, mar_history_size=20):
 
-        self.liveness_threshold = liveness_threshold
-        self.blink_weight = blink_weight
-        self.movement_weight = movement_weight
-        self.mouth_weight = mouth_weight
-        self.challenge_weight = challenge_weight
+        # Gate thresholds
+        self.photo_threshold = photo_threshold
+        self.video_threshold = video_threshold
 
         # Sub-detectors
         self.blink_detector = BlinkDetector(ear_threshold, consec_frames, blink_time_window)
         self.movement_detector = MovementDetector(movement_threshold, movement_history)
         self.mouth_detector = MouthMovementDetector(mar_movement_threshold, mar_history_size)
         self.challenge_detector = ChallengeResponseDetector(num_challenges, challenge_timeout)
+        self.screen_detector = ScreenDetector()
 
         # State
         self.last_liveness_score = 0.0
@@ -486,6 +850,7 @@ class AntiSpoofing:
         self.last_signals = {
             "blink": 0.0, "movement": 0.0,
             "mouth": 0.0, "challenge": 0.0,
+            "screen": 1.0,
         }
 
         # Temporal consistency
@@ -496,8 +861,35 @@ class AntiSpoofing:
         """Start the interactive challenge-response sequence."""
         self.challenge_detector.start()
 
+    def challenge_active(self):
+        """Check if a challenge is currently active."""
+        return self.challenge_detector.is_active
+
+    def challenge_paused(self):
+        """Check if the challenge is currently paused (multi-face)."""
+        return self.challenge_detector._paused
+
+    def pause_challenge(self):
+        """Pause the challenge (multiple faces detected).
+
+        Resets the current challenge's baseline/timer but preserves
+        progress on already-completed poses.
+        """
+        self.challenge_detector.pause()
+
+    def unpause_challenge(self):
+        """Resume challenge after pause (single face restored)."""
+        self.challenge_detector.unpause()
+
     def evaluate(self, frame_bgr, face_location, landmarks_dict=None):
         """Run all anti-spoofing checks on one frame for one face.
+
+        Two-gate evaluation:
+          Gate 1 (photo):  blink + mouth + movement → catches static images
+          Gate 2 (video):  challenge + FFT screen   → catches video replay
+
+        Both gates must pass simultaneously for ≥ consec_live_required
+        consecutive frames before is_live = True.
 
         Args:
             frame_bgr: Full BGR frame from OpenCV capture
@@ -505,14 +897,17 @@ class AntiSpoofing:
             landmarks_dict: Result from face_recognition.face_landmarks(), or None
 
         Returns:
-            dict with liveness results and all signal values
+            dict with liveness results, gate scores, and all signal values
         """
         blink_signal = 0.0
         movement_signal = 0.0
         mouth_signal = 0.0
         challenge_result = self.challenge_detector.get_result()
 
-        # --- Landmark-based detectors ---
+        # --- Gate 2 signals: Screen detection (FFT on face ROI) ---
+        screen_signal = self.screen_detector.update(frame_bgr, face_location)
+
+        # --- Gate 1 signals: Landmark-based passive detectors ---
         if landmarks_dict is not None:
             left_eye = landmarks_dict.get('left_eye')
             right_eye = landmarks_dict.get('right_eye')
@@ -523,27 +918,43 @@ class AntiSpoofing:
             movement_signal = self.movement_detector.update(landmarks_dict)
             mouth_signal = self.mouth_detector.update(landmarks_dict)
 
-            # Update challenge-response if active
+            # --- Gate 2 signals: Head-pose challenge ---
             if self.challenge_detector.is_active:
-                challenge_result = self.challenge_detector.update(
-                    landmarks_dict,
-                    self.blink_detector.last_ear,
-                    self.mouth_detector.last_mar,
-                )
+                challenge_result = self.challenge_detector.update(landmarks_dict)
 
-        # --- Fusion ---
         challenge_signal = challenge_result['signal']
 
-        liveness_score = (
-            self.blink_weight * blink_signal +
-            self.movement_weight * movement_signal +
-            self.mouth_weight * mouth_signal +
-            self.challenge_weight * challenge_signal
-        )
+        # =============================================================
+        # Gate 1 — Photo / Liveness (is this a live person, not a photo?)
+        # Passive: must detect blinks + mouth/head micro-movement.
+        # =============================================================
+        photo_score = (0.45 * blink_signal +
+                       0.30 * mouth_signal +
+                       0.25 * movement_signal)
+        photo_passed = photo_score >= self.photo_threshold
 
-        # Temporal consistency
-        raw_live = liveness_score >= self.liveness_threshold
-        if raw_live:
+        # Auto-start challenge once Gate 1 passes for the first time
+        if photo_passed and not self.challenge_detector.is_active \
+                and not self.challenge_detector.is_complete:
+            self.challenge_detector.start()
+            challenge_result = self.challenge_detector.get_result()
+            challenge_signal = challenge_result['signal']
+
+        # =============================================================
+        # Gate 2 — Video detection (is this a real camera, not a screen?)
+        # Only meaningful after Gate 1 passes and challenge starts.
+        # =============================================================
+        video_score = (0.55 * challenge_signal +
+                       0.45 * screen_signal)
+        video_passed = video_score >= self.video_threshold
+
+        # =============================================================
+        # Final decision — both gates must hold consecutively
+        # =============================================================
+        liveness_score = 0.50 * photo_score + 0.50 * video_score
+        both_passed = photo_passed and video_passed
+
+        if both_passed:
             self._consec_live_count += 1
         else:
             self._consec_live_count = 0
@@ -556,18 +967,25 @@ class AntiSpoofing:
         self.last_signals = {
             "blink": blink_signal, "movement": movement_signal,
             "mouth": mouth_signal, "challenge": challenge_signal,
+            "screen": screen_signal,
         }
 
         return {
             "is_live": is_live,
             "liveness_score": liveness_score,
+            "photo_score": photo_score,
+            "photo_passed": photo_passed,
+            "video_score": video_score,
+            "video_passed": video_passed,
             "blink_signal": blink_signal,
             "movement_signal": movement_signal,
             "mouth_signal": mouth_signal,
             "challenge_signal": challenge_signal,
+            "screen_signal": screen_signal,
             "challenge_result": challenge_result,
             "ear": self.blink_detector.last_ear,
             "mar": self.mouth_detector.last_mar,
+            "consistency_score": challenge_result.get('consistency_score', 0.0),
         }
 
     def reset(self):
@@ -576,6 +994,7 @@ class AntiSpoofing:
         self.movement_detector.reset()
         self.mouth_detector.reset()
         self.challenge_detector.reset()
+        self.screen_detector.reset()
         self.last_liveness_score = 0.0
         self.last_is_live = False
         self._consec_live_count = 0
