@@ -200,6 +200,7 @@ class FaceRecognitionApp:
                 if ret:
                     ret, frame = cap.retrieve()
                     if ret:
+                        frame = cv2.flip(frame, 1)  # mirror horizontally (selfie-view)
                         with lock:
                             captured_frame[0] = frame
                 else:
@@ -246,11 +247,15 @@ class FaceRecognitionApp:
                     num_faces = len(locs)
                     has_face_now = num_faces > 0
 
-                    # Reset anti-spoof when face reappears after leaving
+                    # Reset anti-spoof when face disappears or reappears
                     if has_face_now and not face_present_last_frame[0]:
                         if self.anti_spoof:
                             self.anti_spoof.reset()
                             print("[AUTO] New face detected. Liveness check started.")
+                    elif not has_face_now and face_present_last_frame[0]:
+                        if self.anti_spoof:
+                            self.anti_spoof.reset()
+                            print("[AUTO] Face lost. System reset.")
 
                     # 3. MULTI-FACE PAUSE: halt challenge if >1 face
                     if self.anti_spoof and self.anti_spoof.challenge_active():
@@ -283,6 +288,26 @@ class FaceRecognitionApp:
                         new_spoof = self.anti_spoof.evaluate(
                             frame, first_loc, lm_dict
                         )
+                    elif self.anti_spoof and not has_face_now:
+                        # No face → push a zeroed-out result to clear HUD
+                        new_spoof = {
+                            'is_live': False,
+                            'photo_passed': False,
+                            'video_passed': False,
+                            'photo_score': 0.0,
+                            'video_score': 0.0,
+                            'liveness_score': 0.0,
+                            'blink_signal': 0.0,
+                            'mouth_signal': 0.0,
+                            'movement_signal': 0.0,
+                            'depth_motion_signal': 0.0,
+                            'challenge_signal': 0.0,
+                            'screen_signal': 0.0,
+                            'reflection_signal': 0.0,
+                            'consistency_score': 0.0,
+                            'challenge_result': None,
+                            'no_face': True,
+                        }
                     
                 finally:
                     with lock:
@@ -343,6 +368,10 @@ class FaceRecognitionApp:
             if local_spoof is not None:
                 display_spoof = local_spoof
                 display_is_live = local_spoof["is_live"]
+                # If no face, clear HUD and boxes
+                if local_spoof.get('no_face'):
+                    display_boxes = []
+                    display_matches = []
 
             # --- Draw face boxes ---
             for idx, box in enumerate(display_boxes):
@@ -363,11 +392,13 @@ class FaceRecognitionApp:
                 label = f"{match['name']} ({match['confidence']:.0%})"
                 if self.anti_spoof and display_spoof:
                     if display_is_live:
-                        status = "LIVE"
+                        status = "REAL"
+                    elif display_spoof.get('photo_passed') and display_spoof.get('video_passed'):
+                        status = "VERIFYING"
                     elif display_spoof.get('photo_passed'):
-                        status = "CHECKING VIDEO"
+                        status = "VIDEO CHECK"
                     else:
-                        status = "CHECKING LIVENESS"
+                        status = "PHOTO CHECK"
                     label += f" [{status}]"
 
                 cv2.putText(frame, label, (left, max(top - 10, 20)),
@@ -376,40 +407,54 @@ class FaceRecognitionApp:
             # --- HUD overlay ---
             if self.anti_spoof and display_spoof:
                 y = 25
-                # Gate 1 — Photo / Liveness
-                photo_ok = display_spoof.get('photo_passed', False)
-                g1_color = (0, 255, 0) if photo_ok else (0, 0, 255)
-                cv2.putText(frame, f"PHOTO  {'PASS' if photo_ok else 'FAIL'} {display_spoof.get('photo_score', 0):.2f}",
-                           (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, g1_color, 1)
-                y += 18
-                for text in (
-                    f"  Blink: {display_spoof['blink_signal']:.2f}",
-                    f"  Mouth: {display_spoof.get('mouth_signal', 0):.2f}",
-                    f"  Move:  {display_spoof['movement_signal']:.2f}",
-                ):
-                    cv2.putText(frame, text, (10, y),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 255), 1)
-                    y += 16
 
-                # Gate 2 — Video
-                video_ok = display_spoof.get('video_passed', False)
-                g2_color = (0, 255, 0) if video_ok else (0, 0, 255)
-                cv2.putText(frame, f"VIDEO  {'PASS' if video_ok else 'FAIL'} {display_spoof.get('video_score', 0):.2f}",
-                           (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, g2_color, 1)
-                y += 18
-                for text in (
-                    f"  Chall: {display_spoof.get('challenge_signal', 0):.2f}",
-                    f"  Screen:{display_spoof.get('screen_signal', 1.0):.2f}",
-                    f"  Depth: {display_spoof.get('consistency_score', 0):.2f}",
-                ):
-                    cv2.putText(frame, text, (10, y),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 255), 1)
-                    y += 16
+                # No face → show minimal "NO FACE" HUD
+                if display_spoof.get('no_face'):
+                    cv2.putText(frame, "NO FACE DETECTED", (10, y),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.50, (100, 100, 100), 1)
+                    y += 22
+                    cv2.putText(frame, "System reset - waiting...", (10, y),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.40, (100, 100, 100), 1)
+                else:
+                    # Gate 1 — Photo / Liveness
+                    photo_ok = display_spoof.get('photo_passed', False)
+                    g1_color = (0, 255, 0) if photo_ok else (0, 0, 255)
+                    cv2.putText(frame, f"GATE1  {'PASS' if photo_ok else 'FAIL'} {display_spoof.get('photo_score', 0):.2f}",
+                               (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, g1_color, 1)
+                    y += 18
+                    for text in (
+                        f"  Blink: {display_spoof['blink_signal']:.2f}",
+                        f"  Mouth: {display_spoof.get('mouth_signal', 0):.2f}",
+                        f"  Move:  {display_spoof.get('movement_signal', 0):.2f}",
+                        f"  3Ddep: {display_spoof.get('depth_motion_signal', 0):.2f}",
+                    ):
+                        cv2.putText(frame, text, (10, y),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 255), 1)
+                        y += 16
 
-                # Combined
-                cv2.putText(frame, f"LIVE: {display_spoof['liveness_score']:.2f}",
-                           (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
-                           (0, 255, 0) if display_is_live else (0, 0, 255), 1)
+                    # Gate 2 — Video (only meaningful after Gate 1 passes)
+                    video_ok = display_spoof.get('video_passed', False)
+                    g2_color = (0, 255, 0) if video_ok else (
+                        (0, 200, 255) if photo_ok else (100, 100, 100)
+                    )
+                    g2_label = 'PASS' if video_ok else ('PEND' if photo_ok else 'WAIT')
+                    cv2.putText(frame, f"GATE2  {g2_label} {display_spoof.get('video_score', 0):.2f}",
+                               (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, g2_color, 1)
+                    y += 18
+                    for text in (
+                        f"  Chall: {display_spoof.get('challenge_signal', 0):.2f}",
+                        f"  Scrn:  {display_spoof.get('screen_signal', 1.0):.2f}",
+                        f"  Refl:  {display_spoof.get('reflection_signal', 1.0):.2f}",
+                        f"  Depth: {display_spoof.get('consistency_score', 0):.2f}",
+                    ):
+                        cv2.putText(frame, text, (10, y),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 255), 1)
+                        y += 16
+
+                    # Combined
+                    cv2.putText(frame, f"REAL: {display_spoof['liveness_score']:.2f}",
+                               (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+                               (0, 255, 0) if display_is_live else (0, 0, 255), 1)
 
                 cr = display_spoof.get('challenge_result')
                 if cr:
