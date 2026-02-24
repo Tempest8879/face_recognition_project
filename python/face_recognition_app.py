@@ -16,6 +16,7 @@ import os
 import sys
 import glob
 import time
+import math
 import threading
 from collections import deque
 import numpy as np
@@ -332,6 +333,47 @@ class FaceRecognitionApp:
         smooth_factor = 0.35
         fps_deque = deque(maxlen=120)
 
+        # Robust face tracking with spatial matching
+        LABEL_CONFIRM_FRAMES = 8   # frames needed to change a label
+        MAX_TRACK_AGE = 15         # frames before a lost track is removed
+
+        class FaceTrack:
+            """Track a single face across frames by spatial proximity."""
+            def __init__(self, box, name, confidence):
+                self.box = list(box)            # smoothed display box
+                self.target_box = list(box)     # latest raw box
+                self.stable_name = name         # currently displayed name
+                self.stable_conf = confidence   # currently displayed confidence
+                self.cand_name = name           # candidate for next label
+                self.cand_count = 1             # consecutive frames of candidate
+                self.age = 0                    # frames since last matched
+
+            def center(self):
+                t, r, b, l = self.box
+                return ((t + b) / 2.0, (l + r) / 2.0)
+
+            def update(self, box, name, confidence):
+                self.target_box = list(box)
+                self.age = 0
+                # Update label candidate
+                if name == self.cand_name:
+                    self.cand_count += 1
+                else:
+                    self.cand_name = name
+                    self.cand_count = 1
+                # Promote candidate to stable if confirmed
+                if self.cand_count >= LABEL_CONFIRM_FRAMES:
+                    self.stable_name = self.cand_name
+                    self.stable_conf = confidence
+                elif self.stable_name == name:
+                    self.stable_conf = confidence
+
+            def smooth_box(self, factor):
+                for j in range(4):
+                    self.box[j] += factor * (self.target_box[j] - self.box[j])
+
+        face_tracks = []  # list of FaceTrack
+
         # --- Main display loop ---
         while True:
             with lock:
@@ -349,21 +391,72 @@ class FaceRecognitionApp:
                 fps_deque.popleft()
             fps = len(fps_deque)
 
-            # Smooth bounding box interpolation
+            # Spatial face tracking with label smoothing
             if new_results:
-                target_boxes = [list(loc) for _, loc in new_results]
-                display_matches = [m for m, _ in new_results]
-                if len(display_boxes) != len(target_boxes):
-                    display_boxes = [list(b) for b in target_boxes]
-                else:
-                    for i in range(len(display_boxes)):
-                        for j in range(4):
-                            display_boxes[i][j] += smooth_factor * (
-                                target_boxes[i][j] - display_boxes[i][j]
-                            )
+                new_boxes = [list(loc) for _, loc in new_results]
+                raw_matches = [m for m, _ in new_results]
+
+                # Match new detections to existing tracks by closest center distance
+                used_tracks = set()
+                used_dets = set()
+                assignments = {}  # det_idx -> track_idx
+
+                for di, nb in enumerate(new_boxes):
+                    ct = ((nb[0] + nb[2]) / 2.0, (nb[3] + nb[1]) / 2.0)
+                    best_ti, best_dist = -1, float('inf')
+                    for ti, trk in enumerate(face_tracks):
+                        if ti in used_tracks:
+                            continue
+                        tc = trk.center()
+                        d = ((ct[0] - tc[0])**2 + (ct[1] - tc[1])**2)**0.5
+                        if d < best_dist:
+                            best_dist = d
+                            best_ti = ti
+                    if best_ti >= 0 and best_dist < 200:  # max pixel distance
+                        assignments[di] = best_ti
+                        used_tracks.add(best_ti)
+                        used_dets.add(di)
+
+                # Update matched tracks
+                for di, ti in assignments.items():
+                    face_tracks[ti].update(
+                        new_boxes[di], raw_matches[di]["name"], raw_matches[di]["confidence"]
+                    )
+
+                # Create new tracks for unmatched detections
+                for di in range(len(new_boxes)):
+                    if di not in used_dets:
+                        face_tracks.append(FaceTrack(
+                            new_boxes[di], raw_matches[di]["name"], raw_matches[di]["confidence"]
+                        ))
+
+                # Age unmatched tracks
+                for ti, trk in enumerate(face_tracks):
+                    if ti not in used_tracks and ti < len(face_tracks):
+                        trk.age += 1
+
+                # Remove old tracks
+                face_tracks[:] = [t for t in face_tracks if t.age < MAX_TRACK_AGE]
+
+                # Smooth boxes and build display lists
+                for trk in face_tracks:
+                    trk.smooth_box(smooth_factor)
+
+                display_boxes = [trk.box for trk in face_tracks]
+                display_matches = [{
+                    "name": trk.stable_name,
+                    "distance": 0.0,
+                    "confidence": trk.stable_conf
+                } for trk in face_tracks]
+
             elif not new_results and not face_results_shared:
-                display_boxes = []
-                display_matches = []
+                # Age all tracks when no results
+                for trk in face_tracks:
+                    trk.age += 1
+                face_tracks[:] = [t for t in face_tracks if t.age < MAX_TRACK_AGE]
+                if not face_tracks:
+                    display_boxes = []
+                    display_matches = []
 
             if local_spoof is not None:
                 display_spoof = local_spoof
@@ -535,10 +628,15 @@ class FaceRecognitionApp:
         """Match a face encoding against known faces using C++ or Python backend."""
         if USE_CPP_BACKEND:
             result = self.processor.find_best_match(encoding.tolist())
+            name = result.name
+            conf = result.confidence
+            # Below 60% confidence → treat as Unknown
+            if conf < 0.6:
+                name = "Unknown"
             return {
-                "name": result.name,
+                "name": name,
                 "distance": result.distance,
-                "confidence": result.confidence
+                "confidence": conf
             }
         else:
             if not self.known_encodings:
@@ -547,17 +645,25 @@ class FaceRecognitionApp:
             distances = face_recognition.face_distance(self.known_encodings, encoding)
             best_idx = np.argmin(distances)
             best_distance = distances[best_idx]
-            tolerance = 0.6
+            tolerance = 0.5
 
             if best_distance <= tolerance:
                 name = self.known_names[best_idx]
             else:
                 name = "Unknown"
 
+            # Sigmoid confidence: steep cliff around midpoint (tolerance)
+            k = 20.0
+            conf = 1.0 / (1.0 + math.exp(k * (best_distance - tolerance)))
+
+            # Below 60% confidence → treat as Unknown
+            if conf < 0.6:
+                name = "Unknown"
+
             return {
                 "name": name,
                 "distance": float(best_distance),
-                "confidence": max(0.0, 1.0 - (best_distance / tolerance))
+                "confidence": conf
             }
 
     def _process_frame(self, image, display=False, window_name="Result"):

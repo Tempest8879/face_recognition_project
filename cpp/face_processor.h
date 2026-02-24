@@ -35,7 +35,7 @@ public:
 
     // Compare a face encoding against all known faces
     // Returns the best match with distance and confidence
-    FaceMatch find_best_match(const std::vector<double>& unknown_encoding, double tolerance = 0.6) const {
+    FaceMatch find_best_match(const std::vector<double>& unknown_encoding, double tolerance = 0.5) const {
         if (known_encodings_.empty()) {
             return {"Unknown", 1.0, 0.0};
         }
@@ -58,14 +58,21 @@ public:
             match.name = "Unknown";
         }
         match.distance = best_distance;
-        match.confidence = std::max(0.0, 1.0 - (best_distance / tolerance));
+        // Sigmoid confidence: steep cliff around midpoint (tolerance)
+        // k controls steepness, midpoint = tolerance
+        double k = 20.0;
+        match.confidence = 1.0 / (1.0 + std::exp(k * (best_distance - tolerance)));
+        // Below 60% confidence → treat as Unknown
+        if (match.confidence < 0.6) {
+            match.name = "Unknown";
+        }
         return match;
     }
 
     // Compare all faces in a batch (faster for multiple unknowns)
     std::vector<FaceMatch> find_matches_batch(
         const std::vector<std::vector<double>>& unknown_encodings,
-        double tolerance = 0.6
+        double tolerance = 0.5
     ) const {
         std::vector<FaceMatch> results;
         results.reserve(unknown_encodings.size());
