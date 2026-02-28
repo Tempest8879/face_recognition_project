@@ -6,19 +6,15 @@
 #include <algorithm>
 #include <stdexcept>
 #include <cstdint>
-#include <numeric>
 
 // ============================================================================
 // Face Processor - C++ backend for fast face recognition operations
+// Uses cosine similarity for ArcFace embedding matching
 // ============================================================================
-
-struct FaceLocation {
-    int top, right, bottom, left;
-};
 
 struct FaceMatch {
     std::string name;
-    double distance;
+    double similarity;
     double confidence;
 };
  
@@ -26,44 +22,44 @@ class FaceProcessor {
 public:
     // Store a known face encoding with a name
     void add_known_face(const std::string& name, const std::vector<double>& encoding) {
-        if (encoding.size() != 128) {
-            throw std::invalid_argument("Face encoding must have 128 dimensions");
+        if (encoding.empty()) {
+            throw std::invalid_argument("Face encoding must not be empty");
+        }
+        if (!known_encodings_.empty() && encoding.size() != known_encodings_[0].size()) {
+            throw std::invalid_argument("All face encodings must have the same dimensions");
         }
         known_names_.push_back(name);
         known_encodings_.push_back(encoding);
     }
 
-    // Compare a face encoding against all known faces
-    // Returns the best match with distance and confidence
-    FaceMatch find_best_match(const std::vector<double>& unknown_encoding, double tolerance = 0.5) const {
+    // Compare a face encoding against all known faces using cosine similarity
+    // Returns the best match with similarity and confidence
+    FaceMatch find_best_match(const std::vector<double>& unknown_encoding, double threshold = 0.4) const {
         if (known_encodings_.empty()) {
-            return {"Unknown", 1.0, 0.0};
+            return {"Unknown", 0.0, 0.0};
         }
 
-        double best_distance = 1e9;
+        double best_similarity = -1.0;
         int best_index = -1;
 
         for (size_t i = 0; i < known_encodings_.size(); ++i) {
-            double dist = euclidean_distance(known_encodings_[i], unknown_encoding);
-            if (dist < best_distance) {
-                best_distance = dist;
+            double sim = cosine_similarity(known_encodings_[i], unknown_encoding);
+            if (sim > best_similarity) {
+                best_similarity = sim;
                 best_index = static_cast<int>(i);
             }
         }
 
         FaceMatch match;
-        if (best_distance <= tolerance && best_index >= 0) {
+        match.similarity = best_similarity;
+        // Sigmoid confidence centered on threshold
+        // k=15 gives a steep transition around the threshold
+        double k = 15.0;
+        match.confidence = 1.0 / (1.0 + std::exp(-k * (best_similarity - threshold)));
+        // Above threshold and confident enough → use matched name
+        if (best_similarity >= threshold && best_index >= 0 && match.confidence >= 0.75) {
             match.name = known_names_[best_index];
         } else {
-            match.name = "Unknown";
-        }
-        match.distance = best_distance;
-        // Sigmoid confidence: steep cliff around midpoint (tolerance)
-        // k controls steepness, midpoint = tolerance
-        double k = 20.0;
-        match.confidence = 1.0 / (1.0 + std::exp(k * (best_distance - tolerance)));
-        // Below 60% confidence → treat as Unknown
-        if (match.confidence < 0.6) {
             match.name = "Unknown";
         }
         return match;
@@ -72,12 +68,12 @@ public:
     // Compare all faces in a batch (faster for multiple unknowns)
     std::vector<FaceMatch> find_matches_batch(
         const std::vector<std::vector<double>>& unknown_encodings,
-        double tolerance = 0.5
+        double threshold = 0.4
     ) const {
         std::vector<FaceMatch> results;
         results.reserve(unknown_encodings.size());
         for (const auto& enc : unknown_encodings) {
-            results.push_back(find_best_match(enc, tolerance));
+            results.push_back(find_best_match(enc, threshold));
         }
         return results;
     }
@@ -93,17 +89,21 @@ public:
         known_encodings_.clear();
     }
 
-    // Calculate Euclidean distance between two face encodings
-    static double euclidean_distance(const std::vector<double>& a, const std::vector<double>& b) {
+    // Calculate cosine similarity between two face encodings
+    // Returns value in [-1, 1] where 1 means identical
+    static double cosine_similarity(const std::vector<double>& a, const std::vector<double>& b) {
         if (a.size() != b.size()) {
             throw std::invalid_argument("Encoding dimensions must match");
         }
-        double sum = 0.0;
+        double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
         for (size_t i = 0; i < a.size(); ++i) {
-            double diff = a[i] - b[i];
-            sum += diff * diff;
+            dot += a[i] * b[i];
+            norm_a += a[i] * a[i];
+            norm_b += b[i] * b[i];
         }
-        return std::sqrt(sum);
+        double denom = std::sqrt(norm_a) * std::sqrt(norm_b);
+        if (denom < 1e-10) return 0.0;
+        return dot / denom;
     }
 
 private:

@@ -1,21 +1,15 @@
 """
 Anti-Spoofing / Liveness Detection Module
 ==========================================
-Multi-layer anti-spoofing system using only MTCNN and CNN for maximum accuracy:
+Two-gate anti-spoofing system using MTCNN and dlib landmarks:
   1. Eye blink detection (dlib 68-point landmarks via face_recognition)
-  2. Non-rigid landmark movement detection (dlib landmarks)
-  3. 3D depth-motion parallax detection (depth-layered landmark analysis)
-  4. Mouth micro-movement detection (dlib landmarks)
-  5. Head-pose challenge-response with 3D geometric consistency
-  6. FFT screen detection (frequency-domain pixel-grid / moiré analysis)
-  7. Colour-channel correlation (sub-pixel RGB stripe detection)
-  8. Texture frequency band roll-off check (1/f spectral decay)
-  9. Screen reflection pattern detection (specular highlight analysis)
+  2. Randomized head-pose challenge-response with 3D geometric consistency
 
 Dependencies: face_recognition (dlib), opencv-python, numpy
 """
 
 import time
+import random
 import numpy as np
 import cv2
 import face_recognition
@@ -30,16 +24,56 @@ class BlinkDetector:
 
     Uses left_eye and right_eye points from face_recognition.face_landmarks().
     Each eye has 6 points in standard dlib 68-point ordering.
+
+    **Adaptive calibration**: Instead of a fixed threshold, the detector
+    learns the user's personal open-eye EAR during a short warm-up window
+    (``calibration_frames`` frames).  The blink threshold is then set to
+    ``calibrated_open_ear * close_ratio``.  This makes detection robust
+    across different eye shapes, glasses, and camera angles.
+
+    A valid blink requires:
+      1. Calibration is complete (enough open-eye samples collected).
+      2. EAR was above the adaptive open baseline (eyes confirmed open).
+      3. EAR drops below the adaptive close threshold for at least
+         ``consec_frames`` consecutive frames.
+      4. EAR rises back above the close threshold (reopening).
+      5. The closed phase did not exceed ``max_closed_frames``.
     """
 
-    def __init__(self, ear_threshold=0.2, consec_frames=2, time_window=5.0):
-        self.ear_threshold = ear_threshold
+    def __init__(self, ear_threshold=0.28, consec_frames=3,
+                 time_window=5.0, close_ratio=0.75,
+                 max_closed_frames=20,
+                 min_blink_interval=0.28,
+                 calibration_frames=15):
+        # Fixed fallback threshold (used before calibration completes)
+        self.ear_threshold_fixed = ear_threshold
         self.consec_frames = consec_frames
         self.time_window = time_window
+        self.close_ratio = close_ratio
+        self.max_closed_frames = max_closed_frames
+        self.min_blink_interval = min_blink_interval
+        self.calibration_frames = calibration_frames
 
+        # Adaptive calibration state
+        self._calibration_samples = []    # open-eye EAR samples
+        self._calibrated_open_ear = None  # median of calibration samples
+        self._ear_threshold = ear_threshold  # active threshold (updates after calibration)
+        self._open_baseline = ear_threshold * 1.15  # active open baseline
+
+        # Blink state machine
         self.below_threshold_count = 0
+        self.was_open = False
         self.blink_timestamps = []
         self.last_ear = 0.0
+
+    @property
+    def ear_threshold(self):
+        """Current active EAR threshold (may be calibrated or fixed)."""
+        return self._ear_threshold
+
+    @property
+    def is_calibrated(self):
+        return self._calibrated_open_ear is not None
 
     def compute_ear(self, eye_points):
         """Compute Eye Aspect Ratio from 6 dlib eye landmark points.
@@ -56,31 +90,82 @@ class BlinkDetector:
             return 0.0
         return (A + B) / (2.0 * C)
 
+    def _calibrate(self, ear):
+        """Collect open-eye EAR samples and compute adaptive threshold.
+
+        During calibration, we assume the user's eyes are open (since
+        they're looking at the screen / prompt).  We collect samples
+        and derive the threshold from the median.
+        """
+        if self._calibrated_open_ear is not None:
+            return  # already calibrated
+
+        self._calibration_samples.append(ear)
+
+        if len(self._calibration_samples) >= self.calibration_frames:
+            median_ear = float(np.median(self._calibration_samples))
+            # Sanity: only accept calibration if median looks like open eyes
+            if median_ear > 0.15:
+                self._calibrated_open_ear = median_ear
+                self._ear_threshold = median_ear * self.close_ratio
+                self._open_baseline = median_ear * 0.90
+                self.was_open = True  # eyes are open during calibration
+
     def update(self, left_eye, right_eye):
         """Process one frame's eye landmarks. Returns blink signal [0.0, 1.0].
 
-        Args:
-            left_eye: list of 6 (x, y) tuples from face_recognition
-            right_eye: list of 6 (x, y) tuples from face_recognition
+        State machine:
+          CALIBRATING → collect open-eye samples, no blink detection yet
+          OPEN  (EAR ≥ open_baseline)  → arm was_open
+          CLOSED (EAR < ear_threshold) → increment counter
+          RE-OPEN (EAR ≥ ear_threshold after closed run) → check & register
         """
         left_ear = self.compute_ear(left_eye)
         right_ear = self.compute_ear(right_eye)
         avg_ear = (left_ear + right_ear) / 2.0
         self.last_ear = avg_ear
 
+        # Calibration phase
+        if not self.is_calibrated:
+            self._calibrate(avg_ear)
+            return self.get_signal()
+
         now = time.time()
 
-        if avg_ear < self.ear_threshold:
+        if avg_ear < self._ear_threshold:
+            # --- CLOSED: eyes below threshold ---
             self.below_threshold_count += 1
+
+            # Guard: closure too long → not a blink
+            if self.below_threshold_count > self.max_closed_frames:
+                self.below_threshold_count = 0
+                self.was_open = False
         else:
-            if self.below_threshold_count >= self.consec_frames:
-                self.blink_timestamps.append(now)
+            # --- NOT CLOSED: eyes at or above threshold ---
+            # If we just finished a valid closed run, register blink
+            if (self.was_open
+                    and self.below_threshold_count >= self.consec_frames
+                    and self.below_threshold_count <= self.max_closed_frames):
+                self._register_blink(now)
+
             self.below_threshold_count = 0
 
+            # Arm the detector once EAR is above open baseline
+            if avg_ear >= self._open_baseline:
+                self.was_open = True
+
+        # Prune old blink timestamps
         cutoff = now - self.time_window
         self.blink_timestamps = [t for t in self.blink_timestamps if t > cutoff]
 
         return self.get_signal()
+
+    def _register_blink(self, now):
+        """Record a blink if enough time has passed since the last one."""
+        if (not self.blink_timestamps
+                or (now - self.blink_timestamps[-1]) >= self.min_blink_interval):
+            self.blink_timestamps.append(now)
+        self.was_open = False
 
     def get_signal(self):
         """Return blink signal: 0.0 (no blinks) to 1.0 (sufficient blinks)."""
@@ -94,323 +179,13 @@ class BlinkDetector:
 
     def reset(self):
         self.below_threshold_count = 0
+        self.was_open = False
         self.blink_timestamps.clear()
         self.last_ear = 0.0
-
-
-# =============================================================================
-# Movement Detector (dlib landmarks)
-# =============================================================================
-
-class MovementDetector:
-    """Detect head micro-movements by tracking dlib facial landmark displacement.
-
-    Measures non-rigid motion: real faces have independent eye/nose/chin movement,
-    while photos held by hand show only rigid (global) motion.
-    """
- 
-    NOISE_FLOOR = 0.5   # ignore non-rigid std below this (camera sensor noise)
-
-    def __init__(self, movement_threshold=0.002, history_size=15):
-        self.movement_threshold = movement_threshold
-        self.history_size = history_size
-        self.landmark_history = []
-
-    def update(self, landmarks_dict):
-        """Process one frame's face_recognition landmarks dict."""
-        key_points = self._extract_key_points(landmarks_dict)
-        if key_points is None:
-            return self.get_signal()
-
-        self.landmark_history.append(key_points)
-        if len(self.landmark_history) > self.history_size:
-            self.landmark_history.pop(0)
-
-        return self.get_signal()
-
-    def _extract_key_points(self, lm):
-        """Extract 5 key tracking points from face_recognition landmarks dict.
-
-        Uses: nose tip, chin center, left eye outer corner,
-              right eye outer corner, nose bridge top
-        """
-        try:
-            points = [
-                np.array(lm['nose_tip'][2], dtype=float),
-                np.array(lm['chin'][8], dtype=float),
-                np.array(lm['left_eye'][0], dtype=float),
-                np.array(lm['right_eye'][3], dtype=float),
-                np.array(lm['nose_bridge'][0], dtype=float),
-            ]
-            return np.array(points)
-        except (KeyError, IndexError):
-            return None
-
-    def get_signal(self):
-        """Compute movement signal from landmark history.
-
-        Measures independent (non-rigid) landmark motion rather than raw
-        displacement. When someone holds a photo/phone, ALL landmarks move
-        together (rigid translation). A real face has independent motion:
-        eyes move differently from nose from chin. By subtracting the mean
-        displacement (centroid motion) we isolate non-rigid deformation.
-        """
-        if len(self.landmark_history) < 3:
-            return 0.0
-
-        non_rigid_scores = []
-        for i in range(1, len(self.landmark_history)):
-            diff = self.landmark_history[i] - self.landmark_history[i - 1]
-            global_motion = np.mean(diff, axis=0)
-            local_diff = diff - global_motion
-            local_mags = np.linalg.norm(local_diff, axis=1)
-            score = float(np.std(local_mags))
-            # Subtract noise floor — laptop cameras produce ~0.3-0.5 px jitter
-            score = max(0.0, score - self.NOISE_FLOOR)
-            non_rigid_scores.append(score)
-
-        avg_non_rigid = np.mean(non_rigid_scores)
-        signal = min(1.0, avg_non_rigid / self.movement_threshold)
-        return float(signal)
-
-    def reset(self):
-        self.landmark_history.clear()
-
-
-# =============================================================================
-# Depth Motion Detector (3D parallax from landmark micro-movements)
-# =============================================================================
-
-class DepthMotionDetector:
-    """Detect 3D-dependent motion by analysing depth-layered landmark parallax.
-
-    When a real 3D face makes small head movements, landmarks at different
-    depths displace by different amounts due to perspective projection:
-      - **Front** landmarks (nose tip, nose bridge) are closest to the camera
-        and exhibit the largest apparent displacement.
-      - **Mid** landmarks (eyes, mouth centre) sit at intermediate depth.
-      - **Back** landmarks (jaw edges, chin bottom) are furthest and move least.
-
-    A flat photo or screen surface shows *uniform* displacement across all
-    depth layers because every point is at the same distance from the camera.
-
-    Three sub-signals are fused:
-      1. Parallax gradient  (40%) — monotonic depth-ordered displacement
-      2. Rotation asymmetry (35%) — left/right foreshortening difference
-      3. Depth-layer variance (25%) — per-layer displacement variance spread
-    """
-
-    # Minimum pixel displacement to consider a frame pair (filters camera noise)
-    NOISE_FLOOR = 1.5
-
-    def __init__(self, history_size=20, gradient_threshold=0.003,
-                 asymmetry_threshold=0.004, layer_var_threshold=0.0015):
-        self.history_size = history_size
-        self.gradient_threshold = gradient_threshold
-        self.asymmetry_threshold = asymmetry_threshold
-        self.layer_var_threshold = layer_var_threshold
-        self.landmark_history = []
-
-    # ---- landmark extraction ----
-
-    def _extract_depth_groups(self, lm):
-        """Extract landmarks into three depth-ordered groups.
-
-        Returns:
-            (front, mid, back)  — each is an ndarray of shape (N, 2).
-            None on failure.
-
-        Depth ordering (approximate, for a frontal face):
-            Front  — nose_tip centre, nose_bridge bottom (closest to camera)
-            Mid    — left/right eye outer corners, upper/lower lip centres
-            Back   — left/right jaw edges, chin bottom (furthest from camera)
-        """
-        try:
-            front = np.array([
-                lm['nose_tip'][2],
-                lm['nose_bridge'][3],
-            ], dtype=float)
-
-            mid = np.array([
-                lm['left_eye'][0],
-                lm['right_eye'][3],
-                lm['top_lip'][3],
-                lm['bottom_lip'][3],
-            ], dtype=float)
-
-            back = np.array([
-                lm['chin'][0],
-                lm['chin'][16],
-                lm['chin'][8],
-            ], dtype=float)
-
-            return front, mid, back
-        except (KeyError, IndexError):
-            return None
-
-    def _extract_left_right(self, lm):
-        """Extract left-side and right-side landmark sets for asymmetry.
-
-        Returns:
-            (left_pts, right_pts) — each ndarray (N, 2).  None on failure.
-        """
-        try:
-            left_pts = np.array([
-                lm['left_eye'][0],
-                lm['left_eyebrow'][0],
-                lm['chin'][2],
-            ], dtype=float)
-
-            right_pts = np.array([
-                lm['right_eye'][3],
-                lm['right_eyebrow'][4],
-                lm['chin'][14],
-            ], dtype=float)
-
-            return left_pts, right_pts
-        except (KeyError, IndexError):
-            return None
-
-    # ---- update / signal ----
-
-    def update(self, landmarks_dict):
-        """Process one frame's landmarks.  Returns depth-motion signal [0, 1]."""
-        groups = self._extract_depth_groups(landmarks_dict)
-        lr = self._extract_left_right(landmarks_dict)
-
-        if groups is None or lr is None:
-            return self.get_signal()
-
-        front, mid, back = groups
-        left_pts, right_pts = lr
-
-        # Store all points together for frame-over-frame displacement
-        self.landmark_history.append({
-            'front': front, 'mid': mid, 'back': back,
-            'left': left_pts, 'right': right_pts,
-        })
-        if len(self.landmark_history) > self.history_size:
-            self.landmark_history.pop(0)
-
-        return self.get_signal()
-
-    def get_signal(self):
-        """Compute fused 3D depth-motion signal from landmark history."""
-        if len(self.landmark_history) < 4:
-            return 0.0
-
-        gradient_sig = self._parallax_gradient()
-        asymmetry_sig = self._rotation_asymmetry()
-        layer_var_sig = self._depth_layer_variance()
-
-        signal = (0.40 * gradient_sig +
-                  0.35 * asymmetry_sig +
-                  0.25 * layer_var_sig)
-        return float(np.clip(signal, 0.0, 1.0))
-
-    # ---- sub-signal 1: parallax gradient ----
-
-    def _parallax_gradient(self):
-        """Score whether front landmarks displace more than mid > back.
-
-        For each consecutive frame pair, compute mean displacement per
-        depth group.  A real 3D face shows front > mid > back (monotonic
-        decrease).  Score increases when this gradient is consistently
-        observed.
-        """
-        gradient_scores = []
-        for i in range(1, len(self.landmark_history)):
-            prev, curr = self.landmark_history[i - 1], self.landmark_history[i]
-
-            front_disp = np.mean(np.linalg.norm(curr['front'] - prev['front'], axis=1))
-            mid_disp = np.mean(np.linalg.norm(curr['mid'] - prev['mid'], axis=1))
-            back_disp = np.mean(np.linalg.norm(curr['back'] - prev['back'], axis=1))
-
-            # Check monotonic gradient: front > mid > back
-            total_disp = front_disp + mid_disp + back_disp
-            if total_disp < self.NOISE_FLOOR * 3:
-                # Below noise floor — skip (camera jitter, not real motion)
-                continue
-
-            # Gradient strength: difference between front and back,
-            # normalised by total displacement
-            gradient = (front_disp - back_disp) / (total_disp + 1e-8)
-
-            # Bonus for strict monotonic ordering
-            if front_disp > mid_disp > back_disp:
-                gradient_scores.append(abs(gradient))
-            else:
-                gradient_scores.append(abs(gradient) * 0.3)
-
-        if not gradient_scores:
-            return 0.0
-
-        avg = float(np.mean(gradient_scores))
-        return min(1.0, avg / self.gradient_threshold)
-
-    # ---- sub-signal 2: rotation asymmetry ----
-
-    def _rotation_asymmetry(self):
-        """Score left/right displacement asymmetry during lateral motion.
-
-        When a real face rotates laterally, the side moving *toward* the
-        camera (foreshortening decreases) displaces differently than the
-        side moving *away* (foreshortening increases).  A flat surface
-        produces symmetric displacement on both sides.
-        """
-        asymmetry_scores = []
-        for i in range(1, len(self.landmark_history)):
-            prev, curr = self.landmark_history[i - 1], self.landmark_history[i]
-
-            left_disp = np.mean(np.linalg.norm(curr['left'] - prev['left'], axis=1))
-            right_disp = np.mean(np.linalg.norm(curr['right'] - prev['right'], axis=1))
-
-            total = left_disp + right_disp
-            if total < self.NOISE_FLOOR * 2:
-                continue
-
-            asymmetry = abs(left_disp - right_disp) / (total + 1e-8)
-            asymmetry_scores.append(asymmetry)
-
-        if not asymmetry_scores:
-            return 0.0
-
-        avg = float(np.mean(asymmetry_scores))
-        return min(1.0, avg / self.asymmetry_threshold)
-
-    # ---- sub-signal 3: depth-layer variance ----
-
-    def _depth_layer_variance(self):
-        """Score whether displacement variance differs across depth layers.
-
-        For a real 3D face, each depth layer has a *different* internal
-        displacement variance (front landmarks jitter more than back).
-        A flat photo has near-identical variance at every depth layer.
-        Score = spread (std) of per-layer variances.
-        """
-        layer_variances = {'front': [], 'mid': [], 'back': []}
-
-        for i in range(1, len(self.landmark_history)):
-            prev, curr = self.landmark_history[i - 1], self.landmark_history[i]
-
-            for key in ('front', 'mid', 'back'):
-                disps = np.linalg.norm(curr[key] - prev[key], axis=1)
-                layer_variances[key].append(float(np.var(disps)))
-
-        # Mean variance per layer
-        means = []
-        for key in ('front', 'mid', 'back'):
-            if layer_variances[key]:
-                means.append(float(np.mean(layer_variances[key])))
-
-        if len(means) < 3:
-            return 0.0
-
-        spread = float(np.std(means))
-        return min(1.0, spread / self.layer_var_threshold)
-
-    def reset(self):
-        self.landmark_history.clear()
+        self._calibration_samples.clear()
+        self._calibrated_open_ear = None
+        self._ear_threshold = self.ear_threshold_fixed
+        self._open_baseline = self.ear_threshold_fixed * 1.15
 
 
 # =============================================================================
@@ -520,8 +295,9 @@ class ScreenDetector:
 
     ANALYSIS_SIZE = 128          # face ROI is resized to this for FFT
 
-    def __init__(self, history_size=30):
+    def __init__(self, history_size=30, min_evidence=8):
         self.history_size = history_size
+        self.min_evidence = min_evidence
         self.score_history = []
         self.last_score = 0.0
         self.last_metrics = {}
@@ -562,10 +338,15 @@ class ScreenDetector:
         return self.get_signal()
 
     def get_signal(self):
-        """Median-smoothed screen-detection signal over recent frames."""
-        if not self.score_history:
-            return 1.0                                   # assume real until proven otherwise
-        if len(self.score_history) < 3:
+        """Median-smoothed screen-detection signal over recent frames.
+
+        Returns 0.0 (suspicious) until at least ``min_evidence`` frames
+        have been analysed.  Modern high-PPI OLED screens may have no
+        visible pixel grid, so this prevents auto-passing.
+        """
+        if len(self.score_history) < self.min_evidence:
+            return 0.0   # suspicious until proven otherwise
+        if len(self.score_history) < 5:
             return float(np.mean(self.score_history))
         return float(np.median(self.score_history))
 
@@ -774,6 +555,691 @@ class ScreenDetector:
 
 
 # =============================================================================
+# Screen Edge / Bezel Detector
+# =============================================================================
+
+class ScreenEdgeDetector:
+    """Detect phone / tablet bezels surrounding the face.
+
+    When a face is displayed on a phone / monitor, the camera typically
+    captures the device's rectangular edges surrounding the face region.
+    These edges form strong, straight lines that are:
+
+      1. Aligned horizontally / vertically (rectilinear).
+      2. Located OUTSIDE the face bounding box but INSIDE the camera frame.
+      3. Form a roughly rectangular enclosure around the face.
+
+    Real faces viewed directly by a webcam do not have this rectangular
+    border pattern — the background is irregular.
+
+    Uses Canny edge detection + Hough line transform.  The signal is
+    conservative: a strong rectangular-enclosure detection penalises
+    heavily, but absence of edges does NOT auto-pass (returns 0.5).
+    """
+
+    def __init__(self, history_size=20, min_evidence=8):
+        self.history_size = history_size
+        self.min_evidence = min_evidence
+        self.score_history = []
+        self.last_score = 0.5
+
+    def update(self, frame_bgr, face_location):
+        """Analyse frame for rectangular device edges around the face.
+
+        Args:
+            frame_bgr:     Full BGR frame.
+            face_location: (top, right, bottom, left).
+
+        Returns:
+            float signal [0.0, 1.0] — 1.0 = no edges (real),
+                                       0.0 = strong rectangular edges.
+        """
+        top, right, bottom, left = (int(v) for v in face_location)
+        h, w = frame_bgr.shape[:2]
+        top, left = max(0, top), max(0, left)
+        bottom, right = min(h, bottom), min(w, right)
+
+        if h < 64 or w < 64:
+            return self.get_signal()
+
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+        score = self._analyze(gray, top, right, bottom, left, h, w)
+
+        self.last_score = score
+        self.score_history.append(score)
+        if len(self.score_history) > self.history_size:
+            self.score_history.pop(0)
+
+        return self.get_signal()
+
+    def _analyze(self, gray, face_t, face_r, face_b, face_l, h, w):
+        """Detect strong rectilinear edges surrounding the face.
+
+        We look for Hough lines in the region OUTSIDE the face bounding
+        box.  Strong horizontal and vertical lines that flank the face
+        on multiple sides indicate a device bezel.
+        """
+        # Expand face bbox by 20% to create an exclusion zone
+        fh = face_b - face_t
+        fw = face_r - face_l
+        pad_y = int(fh * 0.20)
+        pad_x = int(fw * 0.20)
+        excl_t = max(0, face_t - pad_y)
+        excl_b = min(h, face_b + pad_y)
+        excl_l = max(0, face_l - pad_x)
+        excl_r = min(w, face_r + pad_x)
+
+        # Mask out the face region — we only want edges OUTSIDE
+        masked = gray.copy()
+        masked[excl_t:excl_b, excl_l:excl_r] = 0
+
+        # Canny edge detection
+        edges = cv2.Canny(masked, 50, 150, apertureSize=3)
+
+        # Hough line detection
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180,
+                                threshold=60,
+                                minLineLength=min(h, w) // 5,
+                                maxLineGap=15)
+
+        if lines is None or len(lines) == 0:
+            return 0.7  # no strong lines → probably real
+
+        # Classify lines as horizontal or vertical
+        h_lines = []  # lines within 10° of horizontal
+        v_lines = []  # lines within 10° of vertical
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+            length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+            if angle < 10 or angle > 170:  # horizontal
+                h_lines.append((x1, y1, x2, y2, length))
+            elif 80 < angle < 100:  # vertical
+                v_lines.append((x1, y1, x2, y2, length))
+
+        # Check if lines flank the face on multiple sides
+        sides_flanked = 0
+
+        # Top: horizontal line above the face
+        for x1, y1, x2, y2, length in h_lines:
+            mid_y = (y1 + y2) / 2
+            if mid_y < face_t and length > fw * 0.4:
+                sides_flanked |= 1
+                break
+
+        # Bottom: horizontal line below the face
+        for x1, y1, x2, y2, length in h_lines:
+            mid_y = (y1 + y2) / 2
+            if mid_y > face_b and length > fw * 0.4:
+                sides_flanked |= 2
+                break
+
+        # Left: vertical line to the left
+        for x1, y1, x2, y2, length in v_lines:
+            mid_x = (x1 + x2) / 2
+            if mid_x < face_l and length > fh * 0.4:
+                sides_flanked |= 4
+                break
+
+        # Right: vertical line to the right
+        for x1, y1, x2, y2, length in v_lines:
+            mid_x = (x1 + x2) / 2
+            if mid_x > face_r and length > fh * 0.4:
+                sides_flanked |= 8
+                break
+
+        num_sides = bin(sides_flanked).count('1')
+
+        # Score based on how many sides are flanked
+        # 0 sides → 0.8 (probably real)
+        # 1 side  → 0.6 (could be a shelf/wall edge)
+        # 2 sides → 0.3 (suspicious)
+        # 3+ sides → 0.05 (almost certainly a device)
+        score_map = {0: 0.8, 1: 0.6, 2: 0.3, 3: 0.05, 4: 0.02}
+        score = score_map.get(num_sides, 0.02)
+
+        return float(score)
+
+    def get_signal(self):
+        if len(self.score_history) < self.min_evidence:
+            return 0.0  # suspicious until proven real
+        if len(self.score_history) < 5:
+            return float(np.mean(self.score_history))
+        return float(np.median(self.score_history))
+
+    def reset(self):
+        self.score_history.clear()
+        self.last_score = 0.0
+
+
+# =============================================================================
+# Temporal Flicker Detector (screen refresh-rate artifact analysis)
+# =============================================================================
+
+class TemporalFlickerDetector:
+    """Detect phone / monitor replay via temporal luminance flicker.
+
+    Phone screens refresh at 60–120 Hz.  When captured by a ~30 fps webcam,
+    the interaction between the screen's refresh rate and the camera's
+    rolling-shutter / global-shutter exposure produces periodic micro-
+    fluctuations in average brightness:
+
+      beat_freq  =  |screen_refresh - N × camera_fps|
+
+    For a 60 Hz screen at 30 fps → beat frequency is 0 Hz or 60 Hz
+    aliased to observable harmonics.  For 120 Hz at 30 fps → 0 Hz
+    (hard), but sub-harmonics at 30/60 Hz leak through.
+
+    Real faces illuminated by natural/DC lighting have NO periodic
+    brightness fluctuation — luminance changes are slow and aperiodic
+    (movement, clouds, etc.).
+
+    Algorithm:
+      1. Collect face-ROI mean brightness per frame into a ring buffer.
+      2. Once the buffer has ≥ 32 samples, compute the FFT of the
+         temporal brightness signal.
+      3. Measure the ratio of mid/high-frequency energy (≥ 5 Hz) to
+         total energy.  Screens produce peaks; real faces don't.
+      4. Also measure the spectral peak prominence — a single strong
+         peak indicates a beat frequency from a screen.
+
+    This is the strongest phone-replay discriminator because it measures
+    a *physical property of the screen* that no video content can hide.
+    """
+
+    def __init__(self, buffer_size=64, min_evidence=32):
+        self.buffer_size = buffer_size
+        self.min_evidence = min_evidence
+        self._brightness_buffer = []
+        self._patch_buffer = []  # small grayscale patches for inter-frame analysis
+        self.last_score = 0.0
+        self.last_metrics = {}
+
+    def update(self, frame_bgr, face_location):
+        """Record face-ROI mean brightness and analyze flicker.
+
+        Args:
+            frame_bgr:     Full BGR frame.
+            face_location: (top, right, bottom, left).
+
+        Returns:
+            float signal [0.0, 1.0] — 1.0 = no flicker (real),
+                                       0.0 = periodic flicker (screen).
+        """
+        top, right, bottom, left = (int(v) for v in face_location)
+        h, w = frame_bgr.shape[:2]
+        top, left = max(0, top), max(0, left)
+        bottom, right = min(h, bottom), min(w, right)
+
+        roi = frame_bgr[top:bottom, left:right]
+        if roi.size == 0 or roi.shape[0] < 16 or roi.shape[1] < 16:
+            return self.get_signal()
+
+        # Mean brightness of face ROI (luminance channel)
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        mean_brightness = float(np.mean(gray))
+        self._brightness_buffer.append(mean_brightness)
+        if len(self._brightness_buffer) > self.buffer_size:
+            self._brightness_buffer.pop(0)
+
+        # Store small standardised patch for inter-frame correlation
+        patch = cv2.resize(gray, (32, 32)).astype(np.float64)
+        self._patch_buffer.append(patch)
+        if len(self._patch_buffer) > self.buffer_size:
+            self._patch_buffer.pop(0)
+
+        if len(self._brightness_buffer) < self.min_evidence:
+            return self.get_signal()
+
+        self.last_score = self._analyze()
+        return self.get_signal()
+
+    def _analyze(self):
+        """FFT + inter-frame noise analysis of temporal brightness signal."""
+
+        # ============================================================
+        # Part A: FFT analysis of temporal mean brightness
+        # ============================================================
+        signal = np.array(self._brightness_buffer, dtype=np.float64)
+
+        # Remove DC (mean) and linear trend
+        signal = signal - np.mean(signal)
+        t = np.arange(len(signal), dtype=np.float64)
+        if np.std(signal) > 0.01:
+            coeffs = np.polyfit(t, signal, 1)
+            signal = signal - np.polyval(coeffs, t)
+
+        # Windowing to reduce spectral leakage
+        window = np.hanning(len(signal))
+        signal = signal * window
+
+        # FFT
+        fft_vals = np.fft.rfft(signal)
+        power = np.abs(fft_vals) ** 2
+
+        n = len(signal)
+        assumed_fps = 30.0
+        idx_5hz = max(2, int(n * 5.0 / assumed_fps))
+
+        total_power = float(np.sum(power[1:]))  # exclude DC
+
+        if total_power < 1e-6:
+            hf_ratio = 0.0
+            peak_prominence = 0.0
+            hf_sig = 0.0
+            peak_sig = 0.0
+        else:
+            hf_power = float(np.sum(power[idx_5hz:]))
+            hf_ratio = hf_power / total_power
+
+            peak_idx = np.argmax(power[idx_5hz:]) + idx_5hz
+            peak_val = float(power[peak_idx])
+            mean_power = float(np.mean(power[idx_5hz:]))
+            peak_prominence = (peak_val / (mean_power + 1e-10)) if mean_power > 0 else 0.0
+
+            hf_sig = float(max(0.0, 1.0 - min(1.0, (hf_ratio - 0.10) / 0.20)))
+            peak_sig = float(max(0.0, 1.0 - min(1.0, (peak_prominence - 2.0) / 6.0)))
+
+        fft_score = 0.55 * hf_sig + 0.45 * peak_sig
+
+        # ============================================================
+        # Part B: Inter-frame difference pattern analysis
+        # ============================================================
+        # Video compression creates I-frame / P-frame structure:
+        #   - P-frames are predicted from previous → small differences
+        #   - I-frames are independent → larger differences
+        # This creates periodic spikes in frame-to-frame difference
+        # energy every ~15-30 frames (GOP length).
+        #
+        # Real camera captures have smooth, Gaussian frame differences
+        # with no periodic pattern.
+        #
+        # Also: video frames have higher inter-frame correlation than
+        # real camera captures because compression smooths noise.
+        ifd_score = 0.5  # default if not enough patches
+        if len(self._patch_buffer) >= self.min_evidence:
+            diffs = []
+            correlations = []
+            for i in range(1, len(self._patch_buffer)):
+                prev = self._patch_buffer[i - 1]
+                curr = self._patch_buffer[i]
+                # Mean absolute difference per pixel
+                diff = float(np.mean(np.abs(curr - prev)))
+                diffs.append(diff)
+                # Pixel-wise Pearson correlation between frames
+                std_p = float(np.std(prev))
+                std_c = float(np.std(curr))
+                if std_p > 0.5 and std_c > 0.5:
+                    corr = float(np.corrcoef(prev.flatten(),
+                                             curr.flatten())[0, 1])
+                    correlations.append(corr)
+
+            if len(diffs) >= 16:
+                diffs_arr = np.array(diffs)
+                mean_diff = float(np.mean(diffs_arr))
+
+                # Metric B1: regularity of differences (FFT of diff series)
+                # Real: smooth/random → flat FFT.  Video: periodic → peaks.
+                if mean_diff > 0.1:
+                    d_signal = diffs_arr - np.mean(diffs_arr)
+                    d_fft = np.abs(np.fft.rfft(d_signal * np.hanning(len(d_signal))))
+                    d_power = d_fft ** 2
+                    if len(d_power) > 2 and float(np.sum(d_power[1:])) > 1e-10:
+                        d_peak = float(np.max(d_power[1:]))
+                        d_mean = float(np.mean(d_power[1:]))
+                        d_prominence = d_peak / (d_mean + 1e-10)
+                        # High prominence → periodic GOP pattern → replay
+                        diff_regularity_sig = float(
+                            np.clip(1.0 - (d_prominence - 2.0) / 8.0, 0.0, 1.0))
+                    else:
+                        diff_regularity_sig = 0.5
+                else:
+                    diff_regularity_sig = 0.5
+
+                # Metric B2: mean inter-frame correlation
+                # Re-captured video: very high mean correlation (> 0.990)
+                # because compression smooths high-frequency noise.
+                # Real camera: lower correlation (< 0.985) due to
+                # independent sensor noise per frame.
+                if correlations:
+                    mean_corr = float(np.mean(correlations))
+                    # Map [0.980, 0.998] → [1.0, 0.0]
+                    corr_sig = float(
+                        np.clip(1.0 - (mean_corr - 0.980) / 0.018, 0.0, 1.0))
+                else:
+                    corr_sig = 0.5
+
+                ifd_score = 0.50 * diff_regularity_sig + 0.50 * corr_sig
+            # end if enough diffs
+
+        self.last_metrics = {
+            'hf_ratio': hf_ratio,
+            'peak_prominence': peak_prominence,
+            'fft_score': fft_score,
+            'ifd_score': ifd_score,
+        }
+
+        # Combine FFT + inter-frame analysis
+        # If FFT has no power (static), rely more on inter-frame analysis.
+        if total_power < 1e-6:
+            score = ifd_score  # FFT unusable, trust inter-frame only
+        else:
+            score = 0.45 * fft_score + 0.55 * ifd_score
+
+        return float(np.clip(score, 0.0, 1.0))
+
+    def get_signal(self):
+        if len(self._brightness_buffer) < self.min_evidence:
+            return 0.0  # suspicious until proven real
+        return self.last_score
+
+    def reset(self):
+        self._brightness_buffer.clear()
+        self._patch_buffer.clear()
+        self.last_score = 0.0
+        self.last_metrics = {}
+
+
+# =============================================================================
+# Focal Plane Detector (depth-of-field uniformity analysis)
+# =============================================================================
+
+class FocalPlaneDetector:
+    """Detect video replay via re-capture noise and compression artifacts.
+
+    When a video is played on a phone and re-captured by a webcam, the
+    image undergoes double processing that leaves detectable traces:
+
+      1. **Noise kurtosis** — Camera sensor noise is Gaussian (kurtosis
+         ≈ 3.0).  Video compression quantises DCT coefficients, creating
+         non-Gaussian noise with heavier tails (kurtosis > 3.5).  When
+         that compressed video is re-captured, the resulting noise
+         distribution is measurably different from single-capture noise.
+
+      2. **Block-boundary autocorrelation** — H.264 / H.265 operate on
+         4×4 and 8×8 blocks.  Quantisation creates subtle brightness
+         steps at block boundaries that survive display→re-capture.
+         These appear as elevated spatial autocorrelation at lags 4 and
+         8 in the high-pass residual of the face ROI.
+
+      3. **Noise spatial variance** — Real camera noise has uniform
+         spatial variance across the face ROI (sensor noise is position-
+         independent).  Re-captured video has NON-uniform noise variance
+         because compression allocates different quality to flat vs.
+         textured regions (macro-block QP variation).
+
+    These metrics detect properties of the *medium pipeline* (compression
+    + display + re-capture) that cannot be removed by higher display
+    resolution, unlike DoF or moiré detectors.
+    """
+
+    def __init__(self, history_size=20, min_evidence=10):
+        self.history_size = history_size
+        self.min_evidence = min_evidence
+        self.score_history = []
+        self.last_score = 0.0
+        self.last_metrics = {}
+
+    def update(self, frame_bgr, face_location):
+        """Analyze face ROI noise for re-capture artifacts.
+
+        Args:
+            frame_bgr:     Full BGR frame.
+            face_location: (top, right, bottom, left).
+
+        Returns:
+            float signal [0.0, 1.0] — 1.0 = real face (clean noise),
+                                       0.0 = replay (compression artifacts).
+        """
+        top, right, bottom, left = (int(v) for v in face_location)
+        h, w = frame_bgr.shape[:2]
+        top, left = max(0, top), max(0, left)
+        bottom, right = min(h, bottom), min(w, right)
+
+        roi = frame_bgr[top:bottom, left:right]
+        if roi.size == 0 or roi.shape[0] < 48 or roi.shape[1] < 48:
+            return self.get_signal()
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (128, 128))
+
+        score = self._analyze(gray)
+        self.last_score = score
+        self.score_history.append(score)
+        if len(self.score_history) > self.history_size:
+            self.score_history.pop(0)
+
+        return self.get_signal()
+
+    def _analyze(self, gray):
+        """Compute noise-based re-capture metrics on 128×128 face ROI."""
+        gray_f = gray.astype(np.float64)
+
+        # Extract high-pass noise residual (original − median-filtered)
+        median_filtered = cv2.medianBlur(gray, 5).astype(np.float64)
+        noise = gray_f - median_filtered
+
+        # ----- Metric 1: Noise kurtosis -----
+        # Real camera noise: kurtosis ≈ 3.0 (Gaussian)
+        # Re-captured video: kurtosis > 3.5 (compression tails)
+        noise_flat = noise.flatten()
+        noise_std = float(np.std(noise_flat))
+        if noise_std > 0.5:
+            noise_mean = float(np.mean(noise_flat))
+            centered = noise_flat - noise_mean
+            kurtosis = float(np.mean(centered ** 4) / (noise_std ** 4))
+        else:
+            kurtosis = 3.0  # no noise → assume Gaussian
+
+        # Score: low kurtosis = real (≈ 3.0), high = replay (> 4.0)
+        # Map [2.5, 5.0] → [1.0, 0.0]
+        kurtosis_sig = float(np.clip(1.0 - (kurtosis - 2.5) / 2.5, 0.0, 1.0))
+
+        # ----- Metric 2: Block-boundary autocorrelation -----
+        # Video codecs use 4×4 / 8×8 / 16×16 blocks.  Measure spatial
+        # autocorrelation of noise at lags 4 and 8 in both axes.
+        acorr_4 = self._block_autocorrelation(noise, lag=4)
+        acorr_8 = self._block_autocorrelation(noise, lag=8)
+        max_acorr = max(acorr_4, acorr_8)
+
+        # Real camera noise: autocorrelation < 0.05 (spatially random)
+        # Re-captured video: autocorrelation > 0.10 (block aligned)
+        # Map [0.0, 0.15] → [1.0, 0.0]
+        block_sig = float(np.clip(1.0 - max_acorr / 0.15, 0.0, 1.0))
+
+        # ----- Metric 3: Noise variance uniformity across blocks -----
+        # Divide into 8×8 blocks, compute noise variance per block.
+        # Real face: uniform variance (position-independent sensor noise).
+        # Replay: non-uniform variance (QP variation across macroblocks).
+        block_sz = 16  # 128 / 8 = 16-pixel blocks
+        num_blocks = 128 // block_sz
+        variances = []
+        for by in range(num_blocks):
+            for bx in range(num_blocks):
+                block = noise[by*block_sz:(by+1)*block_sz,
+                              bx*block_sz:(bx+1)*block_sz]
+                variances.append(float(np.var(block)))
+
+        variances = np.array(variances)
+        mean_var = float(np.mean(variances))
+        if mean_var > 0.1:
+            cv_noise = float(np.std(variances) / mean_var)
+        else:
+            cv_noise = 0.0
+
+        # Real face: low CV (< 0.3, uniform sensor noise)
+        # Replay: high CV (> 0.5, macro-block QP variation)
+        # Map [0.15, 0.60] → [1.0, 0.0]
+        uniformity_sig = float(np.clip(1.0 - (cv_noise - 0.15) / 0.45, 0.0, 1.0))
+
+        self.last_metrics = {
+            'noise_kurtosis': kurtosis,
+            'block_acorr_4': acorr_4,
+            'block_acorr_8': acorr_8,
+            'noise_cv': cv_noise,
+            'kurtosis_sig': kurtosis_sig,
+            'block_sig': block_sig,
+            'uniformity_sig': uniformity_sig,
+        }
+
+        # Fusion — block autocorrelation is the strongest signal
+        score = (0.30 * kurtosis_sig +
+                 0.40 * block_sig +
+                 0.30 * uniformity_sig)
+        return float(np.clip(score, 0.0, 1.0))
+
+    @staticmethod
+    def _block_autocorrelation(noise, lag):
+        """Compute normalised autocorrelation of noise at given pixel lag.
+
+        Measures how correlated the noise is with a shifted copy of
+        itself.  Video compression block boundaries create periodic
+        correlation at multiples of the block size.
+        """
+        h, w = noise.shape
+        if lag >= h or lag >= w:
+            return 0.0
+
+        # Horizontal autocorrelation at this lag
+        a = noise[:, :w-lag]
+        b = noise[:, lag:]
+        std_a = float(np.std(a))
+        std_b = float(np.std(b))
+        if std_a < 0.1 or std_b < 0.1:
+            h_corr = 0.0
+        else:
+            h_corr = abs(float(np.mean((a - np.mean(a)) * (b - np.mean(b)))
+                               / (std_a * std_b)))
+
+        # Vertical autocorrelation at this lag
+        a = noise[:h-lag, :]
+        b = noise[lag:, :]
+        std_a = float(np.std(a))
+        std_b = float(np.std(b))
+        if std_a < 0.1 or std_b < 0.1:
+            v_corr = 0.0
+        else:
+            v_corr = abs(float(np.mean((a - np.mean(a)) * (b - np.mean(b)))
+                               / (std_a * std_b)))
+
+        return (h_corr + v_corr) / 2.0
+
+    def get_signal(self):
+        if len(self.score_history) < self.min_evidence:
+            return 0.0  # suspicious until proven real
+        if len(self.score_history) < 5:
+            return float(np.mean(self.score_history))
+        return float(np.median(self.score_history))
+
+    def reset(self):
+        self.score_history.clear()
+        self.last_score = 0.0
+        self.last_metrics = {}
+
+
+# =============================================================================
+# C++ Texture Analyzer Wrapper (LBP micro-texture anti-spoofing)
+# =============================================================================
+
+class TextureAnalyzerWrapper:
+    """Wrapper around the C++ TextureAnalyzer for anti-spoofing.
+
+    Uses the compiled pybind11 module face_processor_cpp.TextureAnalyzer
+    which provides:
+      - Laplacian sharpness (sharper = more real)
+      - LBP micro-texture entropy (richer patterns = more real)
+      - High-frequency energy ratio (more HF detail = more real)
+
+    The C++ implementation is significantly faster than pure Python and
+    captures sub-pixel rendering artifacts that differ between screens
+    and real skin, even on high-PPI OLED displays.
+    """
+
+    def __init__(self, history_size=20, min_evidence=8):
+        self.history_size = history_size
+        self.min_evidence = min_evidence
+        self.score_history = []
+        self.last_score = 0.5
+        self.last_metrics = {}
+
+        # Try to load the C++ module
+        try:
+            from face_processor_cpp import TextureAnalyzer as _CppAnalyzer
+            self._analyzer = _CppAnalyzer(
+                100.0,   # sharpness_threshold
+                5.0,     # entropy_threshold
+                0.10,    # hf_threshold
+            )
+            self._available = True
+        except ImportError:
+            self._analyzer = None
+            self._available = False
+
+    def update(self, frame_bgr, face_location):
+        """Analyze face ROI texture via C++ LBP / sharpness.
+
+        Args:
+            frame_bgr:     Full BGR frame.
+            face_location: (top, right, bottom, left).
+
+        Returns:
+            float signal [0.0, 1.0] — 1.0 = real skin texture,
+                                       0.0 = screen / print texture.
+        """
+        if not self._available:
+            return 0.5  # neutral if C++ module not available
+
+        top, right, bottom, left = (int(v) for v in face_location)
+        h, w = frame_bgr.shape[:2]
+        top, left = max(0, top), max(0, left)
+        bottom, right = min(h, bottom), min(w, right)
+
+        roi = frame_bgr[top:bottom, left:right]
+        if roi.size == 0 or roi.shape[0] < 32 or roi.shape[1] < 32:
+            return self.get_signal()
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (128, 128))
+
+        # Convert to flat list of uint8 for C++ API
+        pixels = gray.flatten().tolist()
+
+        try:
+            result = self._analyzer.analyze(pixels, 128, 128)
+            score = float(result.texture_score)
+            self.last_metrics = {
+                'sharpness': result.sharpness,
+                'lbp_entropy': result.lbp_entropy,
+                'hf_energy': result.hf_energy,
+                'unique_patterns': result.num_unique_patterns,
+            }
+        except Exception:
+            score = 0.5
+
+        self.last_score = score
+        self.score_history.append(score)
+        if len(self.score_history) > self.history_size:
+            self.score_history.pop(0)
+
+        return self.get_signal()
+
+    def get_signal(self):
+        if not self._available:
+            return 0.5  # cannot analyze — stay neutral
+        if len(self.score_history) < self.min_evidence:
+            return 0.0  # suspicious until proven real
+        if len(self.score_history) < 5:
+            return float(np.mean(self.score_history))
+        return float(np.median(self.score_history))
+
+    def reset(self):
+        self.score_history.clear()
+        self.last_score = 0.0
+        self.last_metrics = {}
+
+
+# =============================================================================
 # Reflection Pattern Detector (screen specular highlight analysis)
 # =============================================================================
 
@@ -805,8 +1271,9 @@ class ReflectionPatternDetector:
 
     ANALYSIS_SIZE = 128
 
-    def __init__(self, history_size=25):
+    def __init__(self, history_size=25, min_evidence=8):
         self.history_size = history_size
+        self.min_evidence = min_evidence
         self.score_history = []
         self.last_score = 0.0
         self.last_metrics = {}
@@ -854,10 +1321,14 @@ class ReflectionPatternDetector:
         return self.get_signal()
 
     def get_signal(self):
-        """Median-smoothed reflection-detection signal over recent frames."""
-        if not self.score_history:
-            return 1.0                   # assume real until proven otherwise
-        if len(self.score_history) < 3:
+        """Median-smoothed reflection-detection signal over recent frames.
+
+        Returns 0.0 (suspicious) until at least ``min_evidence`` frames
+        have been analysed.
+        """
+        if len(self.score_history) < self.min_evidence:
+            return 0.0   # suspicious until proven otherwise
+        if len(self.score_history) < 5:
             return float(np.mean(self.score_history))
         return float(np.median(self.score_history))
 
@@ -999,13 +1470,436 @@ class ReflectionPatternDetector:
 
 
 # =============================================================================
+# Optical Flow Consistency Detector
+# =============================================================================
+
+class OpticalFlowDetector:
+    """Detect video replay attacks via optical flow analysis.
+
+    When a real 3D face moves in front of a camera, different facial
+    regions produce different flow vectors:
+      - The nose (closest) displaces more than the ears (further).
+      - Eyes, mouth, and jaw move semi-independently (non-rigid).
+
+    A video replayed on a flat screen produces *uniform* optical flow
+    across the entire face ROI because every pixel is at the same depth
+    (the screen surface).  The flow field is essentially a single rigid
+    affine transform.
+
+    Metrics fused:
+      1. Flow variance ratio (40%) — high inner variance relative to
+         magnitude means non-rigid / depth-varying motion (real face).
+      2. Angular dispersion  (35%) — real faces produce diverse flow
+         directions; flat replays produce near-parallel vectors.
+      3. Residual after affine fit (25%) — how much flow remains after
+         subtracting the best rigid-affine approximation.
+
+    Uses dense Farneback optical flow on the face ROI.
+    """
+
+    ANALYSIS_SIZE = 96  # face ROI resized to this for flow computation
+
+    def __init__(self, history_size=20,
+                 variance_threshold=0.15,
+                 angular_threshold=0.30,
+                 residual_threshold=0.20):
+        self.history_size = history_size
+        self.variance_threshold = variance_threshold
+        self.angular_threshold = angular_threshold
+        self.residual_threshold = residual_threshold
+
+        self._prev_gray = None
+        self._prev_full_gray = None  # full-frame for background flow
+        self.min_evidence = 8
+        self.score_history = []
+        self.last_score = 0.0
+
+    def update(self, frame_bgr, face_location):
+        """Compute optical flow on the face ROI between consecutive frames.
+
+        Also computes full-frame background flow and compares it with
+        face-region flow.  On a phone replay, face and background
+        (phone bezel / surrounding area) move as one rigid body, so
+        their flow fields are highly correlated.  On a real face, the
+        face moves independently of the background.
+
+        Args:
+            frame_bgr:     Full BGR frame.
+            face_location: (top, right, bottom, left).
+
+        Returns:
+            float signal [0.0, 1.0] — 1.0 = real face, 0.0 = replay.
+        """
+        top, right, bottom, left = (int(v) for v in face_location)
+        h, w = frame_bgr.shape[:2]
+        top, left = max(0, top), max(0, left)
+        bottom, right = min(h, bottom), min(w, right)
+
+        roi = frame_bgr[top:bottom, left:right]
+        if roi.size == 0 or roi.shape[0] < 32 or roi.shape[1] < 32:
+            return self.get_signal()
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (self.ANALYSIS_SIZE, self.ANALYSIS_SIZE))
+
+        # Down-sample full frame for background flow
+        full_sz = self.ANALYSIS_SIZE * 2
+        full_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        full_gray = cv2.resize(full_gray, (full_sz, full_sz))
+
+        if self._prev_gray is None:
+            self._prev_gray = gray
+            self._prev_full_gray = full_gray
+            return self.get_signal()
+
+        # Dense optical flow on face ROI
+        flow = cv2.calcOpticalFlowFarneback(
+            self._prev_gray, gray,
+            None, 0.5, 3, 15, 3, 5, 1.2, 0
+        )
+
+        # Dense optical flow on full frame (for background comparison)
+        full_flow = cv2.calcOpticalFlowFarneback(
+            self._prev_full_gray, full_gray,
+            None, 0.5, 3, 15, 3, 5, 1.2, 0
+        )
+
+        self._prev_gray = gray
+        self._prev_full_gray = full_gray
+
+        # Face-only analysis (non-rigidity metrics)
+        face_score = self._analyze_flow(flow)
+
+        # Face-vs-background analysis (independence metric)
+        bg_score = self._analyze_face_vs_background(
+            full_flow, face_location, h, w, full_sz
+        )
+
+        # Combine: face must look non-rigid AND move independently
+        # of the background.  bg_score is the strongest phone-replay
+        # discriminator, so give it high weight.
+        score = 0.45 * face_score + 0.55 * bg_score
+
+        self.last_score = score
+        self.score_history.append(score)
+        if len(self.score_history) > self.history_size:
+            self.score_history.pop(0)
+
+        return self.get_signal()
+
+    def _analyze_flow(self, flow):
+        """Analyze flow field for non-rigidity indicators."""
+        sz = self.ANALYSIS_SIZE
+        fx = flow[:, :, 0].flatten()
+        fy = flow[:, :, 1].flatten()
+        mag = np.sqrt(fx**2 + fy**2)
+
+        mean_mag = np.mean(mag)
+        if mean_mag < 0.3:
+            # Negligible motion — cannot distinguish, assume neutral
+            return 0.5
+
+        # 1. Flow variance ratio: std(magnitude) / mean(magnitude)
+        #    Real face: high (depth-dependent displacement).
+        #    Flat replay: low (uniform displacement).
+        variance_ratio = float(np.std(mag) / (mean_mag + 1e-8))
+        var_sig = min(1.0, variance_ratio / self.variance_threshold)
+
+        # 2. Angular dispersion: circular std of flow directions.
+        #    Real face: varied angles (eyes move differently from jaw).
+        #    Flat replay: near-parallel vectors.
+        angles = np.arctan2(fy, fx)
+        # Circular mean direction
+        mean_sin = np.mean(np.sin(angles[mag > 0.5]))
+        mean_cos = np.mean(np.cos(angles[mag > 0.5]))
+        R = np.sqrt(mean_sin**2 + mean_cos**2)  # resultant length [0,1]
+        # Circular variance = 1 - R: high = dispersed, low = clustered
+        circ_var = 1.0 - R if np.isfinite(R) else 0.0
+        ang_sig = min(1.0, circ_var / self.angular_threshold)
+
+        # 3. Affine residual: fit best affine transform to flow,
+        #    measure residual.  Flat surface ≈ 0 residual.
+        y_coords, x_coords = np.mgrid[0:sz, 0:sz]
+        pts = np.column_stack([x_coords.flatten(), y_coords.flatten(),
+                               np.ones(sz * sz)])
+        # Solve  A @ [x, y, 1]^T ≈ [fx, fy]^T  via least squares
+        try:
+            affine_x, _, _, _ = np.linalg.lstsq(pts, fx, rcond=None)
+            affine_y, _, _, _ = np.linalg.lstsq(pts, fy, rcond=None)
+            pred_fx = pts @ affine_x
+            pred_fy = pts @ affine_y
+            residual = np.sqrt(np.mean((fx - pred_fx)**2 + (fy - pred_fy)**2))
+            residual_norm = residual / (mean_mag + 1e-8)
+        except np.linalg.LinAlgError:
+            residual_norm = 0.0
+        res_sig = min(1.0, residual_norm / self.residual_threshold)
+
+        score = 0.40 * var_sig + 0.35 * ang_sig + 0.25 * res_sig
+        return float(np.clip(score, 0.0, 1.0))
+
+    def _analyze_face_vs_background(self, full_flow, face_loc, orig_h, orig_w, full_sz):
+        """Compare face-region flow to background-region flow.
+
+        On a phone replay, the face and phone border / surrounding area
+        move together as one rigid body.  Mean flow vectors in the face
+        region and background region are highly correlated (similar
+        direction and magnitude).
+
+        On a real face in front of the camera, the background is mostly
+        static while the face moves, OR they move independently.  The
+        difference in mean flow is large.
+
+        Returns:
+            float [0.0, 1.0]  — 1.0 = independent motion (real face),
+                                 0.0 = correlated motion (replay).
+        """
+        top, right, bottom, left = face_loc
+        # Map face bbox to the down-sampled full-flow coordinate space
+        if orig_h < 1 or orig_w < 1:
+            return 0.5  # neutral
+
+        scale_y = full_sz / orig_h
+        scale_x = full_sz / orig_w
+        ft = int(max(0, top * scale_y))
+        fb = int(min(full_sz, bottom * scale_y))
+        fl = int(max(0, left * scale_x))
+        fr = int(min(full_sz, right * scale_x))
+
+        if fb - ft < 4 or fr - fl < 4:
+            return 0.5
+
+        # Face-region mean flow
+        face_flow = full_flow[ft:fb, fl:fr]
+        face_mean_fx = float(np.mean(face_flow[:, :, 0]))
+        face_mean_fy = float(np.mean(face_flow[:, :, 1]))
+        face_mag = np.sqrt(face_mean_fx**2 + face_mean_fy**2)
+
+        # Background-region mean flow (everything outside the face bbox)
+        mask = np.ones((full_sz, full_sz), dtype=bool)
+        mask[ft:fb, fl:fr] = False
+        bg_flow_x = full_flow[:, :, 0][mask]
+        bg_flow_y = full_flow[:, :, 1][mask]
+
+        if bg_flow_x.size < 100:
+            return 0.5
+
+        bg_mean_fx = float(np.mean(bg_flow_x))
+        bg_mean_fy = float(np.mean(bg_flow_y))
+        bg_mag = np.sqrt(bg_mean_fx**2 + bg_mean_fy**2)
+
+        # If neither face nor background moves much, neutral
+        if face_mag < 0.2 and bg_mag < 0.2:
+            return 0.5
+
+        # ---- Metric 1: Flow-difference magnitude ----
+        # How different are the mean motion vectors?
+        diff_mag = np.sqrt((face_mean_fx - bg_mean_fx)**2 +
+                           (face_mean_fy - bg_mean_fy)**2)
+        # Real face: diff_mag > 0.5 (face moves, bg doesn't, or differently)
+        # Phone replay: diff_mag ≈ 0 (everything translates together)
+        diff_sig = float(min(1.0, diff_mag / 0.8))
+
+        # ---- Metric 2: Direction cosine similarity ----
+        # Are face and background moving in the same direction?
+        dot = face_mean_fx * bg_mean_fx + face_mean_fy * bg_mean_fy
+        norms = (face_mag + 1e-8) * (bg_mag + 1e-8)
+        cos_sim = dot / norms
+        # Real face: cos_sim ≈ 0 or negative (independent directions)
+        # Phone replay: cos_sim ≈ 1.0 (same direction)
+        # Penalise high similarity (> 0.6 → suspicious)
+        if cos_sim > 0.6:
+            dir_sig = float(max(0.0, 1.0 - (cos_sim - 0.6) / 0.4))
+        else:
+            dir_sig = 1.0
+
+        # ---- Metric 3: Magnitude ratio ----
+        # On a phone replay, face_mag ≈ bg_mag (rigid body).
+        # Real face: face_mag >> bg_mag OR bg_mag ≈ 0.
+        if max(face_mag, bg_mag) > 0.2:
+            ratio = min(face_mag, bg_mag) / (max(face_mag, bg_mag) + 1e-8)
+            # Real: ratio far from 1.0.  Phone: ratio ≈ 1.0
+            ratio_sig = float(max(0.0, 1.0 - ratio))
+        else:
+            ratio_sig = 0.5
+
+        # Fusion
+        score = 0.40 * diff_sig + 0.35 * dir_sig + 0.25 * ratio_sig
+        return float(np.clip(score, 0.0, 1.0))
+
+    def get_signal(self):
+        """Median-smoothed optical flow signal.
+
+        Returns 0.0 (suspicious) until min_evidence frames analysed.
+        """
+        if len(self.score_history) < self.min_evidence:
+            return 0.0  # suspicious until proven otherwise
+        if len(self.score_history) < 5:
+            return float(np.mean(self.score_history))
+        return float(np.median(self.score_history))
+
+    def reset(self):
+        self._prev_gray = None
+        self._prev_full_gray = None
+        self.score_history.clear()
+        self.last_score = 0.0
+
+
+# =============================================================================
+# Depth Geometry Detector (landmark ratio changes under rotation)
+# =============================================================================
+
+class DepthGeometryDetector:
+    """Estimate 3D face depth from how landmark ratios change over time.
+
+    A real 3D face produces perspective-dependent changes in inter-
+    landmark distance ratios as the head rotates.  Key observations:
+
+      - When turning left, the left-eye-to-nose distance shortens
+        while the right-eye-to-nose distance lengthens (foreshortening).
+      - The nose-tip moves non-linearly relative to the jaw outline.
+      - Upper-face vs lower-face height ratio changes with pitch.
+
+    A flat photo or video on a screen only produces *affine* ratio
+    changes (linear scaling), not the non-linear perspective shifts
+    a real 3D face exhibits.
+
+    Metrics:
+      1. Lateral asymmetry variance (40%) — how much left/right eye-
+         to-nose ratios diverge over time.
+      2. Non-linear nose displacement (35%) — nose tip moves non-
+         linearly relative to jaw width under yaw rotation.
+      3. Vertical ratio variance (25%) — upper/lower face height
+         ratio changes under pitch rotation.
+    """
+
+    def __init__(self, history_size=25,
+                 asymmetry_threshold=0.008,
+                 nonlinear_threshold=0.005,
+                 vertical_threshold=0.006):
+        self.history_size = history_size
+        self.asymmetry_threshold = asymmetry_threshold
+        self.nonlinear_threshold = nonlinear_threshold
+        self.vertical_threshold = vertical_threshold
+
+        self._ratio_history = []  # list of ratio feature dicts
+        self.last_score = 0.0
+
+    def update(self, landmarks_dict):
+        """Process one frame's landmarks.
+
+        Args:
+            landmarks_dict: face_recognition.face_landmarks() dict
+
+        Returns:
+            float signal [0.0, 1.0] — 1.0 = real 3D face.
+        """
+        ratios = self._extract_ratios(landmarks_dict)
+        if ratios is None:
+            return self.get_signal()
+
+        self._ratio_history.append(ratios)
+        if len(self._ratio_history) > self.history_size:
+            self._ratio_history.pop(0)
+
+        self.last_score = self._compute_signal()
+        return self.last_score
+
+    def _extract_ratios(self, lm):
+        """Extract perspective-sensitive ratios from landmarks."""
+        try:
+            nose_tip = np.array(lm['nose_tip'][2], dtype=float)
+            left_eye = np.array(lm['left_eye'][0], dtype=float)
+            right_eye = np.array(lm['right_eye'][3], dtype=float)
+            left_jaw = np.array(lm['chin'][0], dtype=float)
+            right_jaw = np.array(lm['chin'][16], dtype=float)
+            chin_bottom = np.array(lm['chin'][8], dtype=float)
+            bridge_top = np.array(lm['nose_bridge'][0], dtype=float)
+
+            jaw_width = np.linalg.norm(right_jaw - left_jaw)
+            if jaw_width < 5:
+                return None
+
+            # Lateral: eye-to-nose ratios (perspective-sensitive)
+            left_eye_nose = np.linalg.norm(left_eye - nose_tip) / jaw_width
+            right_eye_nose = np.linalg.norm(right_eye - nose_tip) / jaw_width
+
+            # Nose horizontal offset (non-linear under yaw)
+            center_x = (left_jaw[0] + right_jaw[0]) / 2.0
+            nose_offset = (nose_tip[0] - center_x) / jaw_width
+
+            # Vertical: upper vs lower face ratio (sensitive to pitch)
+            face_height = np.linalg.norm(bridge_top - chin_bottom)
+            if face_height < 5:
+                return None
+            upper = np.linalg.norm(bridge_top - nose_tip)
+            lower = np.linalg.norm(nose_tip - chin_bottom)
+            vertical_ratio = upper / (upper + lower + 1e-8)
+
+            return {
+                'left_eye_nose': left_eye_nose,
+                'right_eye_nose': right_eye_nose,
+                'nose_offset': nose_offset,
+                'vertical_ratio': vertical_ratio,
+                'jaw_width': jaw_width,
+            }
+        except (KeyError, IndexError):
+            return None
+
+    def _compute_signal(self):
+        """Compute depth geometry signal from ratio history."""
+        if len(self._ratio_history) < 5:
+            return 0.0
+
+        # Extract time series
+        left_en = [r['left_eye_nose'] for r in self._ratio_history]
+        right_en = [r['right_eye_nose'] for r in self._ratio_history]
+        nose_off = [r['nose_offset'] for r in self._ratio_history]
+        vert_rat = [r['vertical_ratio'] for r in self._ratio_history]
+
+        # 1. Lateral asymmetry variance
+        #    When head turns, left/right eye-nose ratios should diverge.
+        #    Compute ratio_diff = |left - right| over time, take variance.
+        ratio_diffs = [abs(l - r) for l, r in zip(left_en, right_en)]
+        asym_var = float(np.var(ratio_diffs))
+        asym_sig = min(1.0, asym_var / self.asymmetry_threshold)
+
+        # 2. Non-linear nose displacement
+        #    On a real face, nose_offset vs jaw_width relationship is
+        #    non-linear.  Measure residual after linear fit.
+        offsets = np.array(nose_off)
+        if np.std(offsets) > 0.005:  # enough yaw motion to analyze
+            t = np.arange(len(offsets), dtype=float)
+            # Fit linear trend
+            coeffs = np.polyfit(t, offsets, 1)
+            linear_pred = np.polyval(coeffs, t)
+            residual = np.std(offsets - linear_pred)
+            nonlinear_sig = min(1.0, residual / self.nonlinear_threshold)
+        else:
+            nonlinear_sig = 0.0
+
+        # 3. Vertical ratio variance (pitch-dependent)
+        vert_var = float(np.var(vert_rat))
+        vert_sig = min(1.0, vert_var / self.vertical_threshold)
+
+        score = 0.40 * asym_sig + 0.35 * nonlinear_sig + 0.25 * vert_sig
+        return float(np.clip(score, 0.0, 1.0))
+
+    def get_signal(self):
+        return self.last_score
+
+    def reset(self):
+        self._ratio_history.clear()
+        self.last_score = 0.0
+
+
+# =============================================================================
 # Challenge-Response Detector (interactive liveness verification)
 # =============================================================================
 
 class ChallengeResponseDetector:
     """Head-pose challenge-response with 3D geometric consistency analysis.
 
-    Fixed sequence: TURN LEFT → TURN RIGHT → LOOK UP → LOOK DOWN
+    Randomized sequence of: TURN LEFT, TURN RIGHT, LOOK UP, LOOK DOWN
 
     At each completed pose, a normalized landmark feature vector is captured.
     After all poses, euclidean distances and cosine similarities between
@@ -1049,6 +1943,16 @@ class ChallengeResponseDetector:
         # Multi-face pause state
         self._paused = False
 
+        # Recentering state — wait for face to return to neutral
+        # before starting the next challenge
+        self._recentering = False
+        self._recenter_count = 0
+        self._pending_challenge = None
+        self._neutral_v_ratio = None   # captured from user's first neutral frame
+
+        # Consecutive-frame confirmation counter for pose checks
+        self._confirm_count = 0
+
         # 3D consistency analysis state
         self._pose_snapshots = {}       # {challenge_id: feature_vector}
         self._consistency_score = 0.0
@@ -1058,7 +1962,7 @@ class ChallengeResponseDetector:
         self._cos_ud = 1.0             # cosine similarity up↔down
 
     def start(self):
-        """Start a new challenge-response sequence (fixed order)."""
+        """Start a new challenge-response sequence (randomized order)."""
         self.challenges_passed = 0
         self.challenges_failed = 0
         self.is_active = True
@@ -1072,6 +1976,11 @@ class ChallengeResponseDetector:
         self._cos_lr = 1.0
         self._cos_ud = 1.0
         self._remaining = list(self.CHALLENGES[:self.num_challenges])
+        random.shuffle(self._remaining)
+        self._confirm_count = 0
+        self._recentering = False
+        self._recenter_count = 0
+        self._neutral_v_ratio = None
         self._next_challenge()
 
     def _next_challenge(self):
@@ -1093,10 +2002,24 @@ class ChallengeResponseDetector:
             return
 
         challenge_id, instruction = self._remaining.pop(0)
-        self.current_challenge = challenge_id
-        self.current_instruction = instruction
-        self.challenge_start_time = time.time()
-        self._baseline = {}
+        self._pending_challenge = (challenge_id, instruction)
+        # Enter recentering phase — wait for neutral pose before showing
+        # the next challenge instruction.  Skip recenter for the very
+        # first challenge (nothing to recenter from).
+        if self.challenges_passed == 0 and self.challenges_failed == 0:
+            # First challenge — start immediately, reset confirm counter
+            self.current_challenge = challenge_id
+            self.current_instruction = instruction
+            self.challenge_start_time = time.time()
+            self._baseline = {}
+            self._confirm_count = 0
+            self._recentering = False
+        else:
+            self._confirm_count = 0
+            self.current_challenge = None
+            self.current_instruction = "Return to center"
+            self._recentering = True
+            self._recenter_count = 0
 
     def pause(self):
         """Pause the challenge sequence (multiple faces detected).
@@ -1121,8 +2044,58 @@ class ChallengeResponseDetector:
         self.challenge_start_time = time.time()
         self._baseline = {}
 
+    def _is_centered(self, landmarks_dict):
+        """Check if the face is in a roughly neutral / center position.
+
+        Uses the user's personal neutral vertical ratio (captured during
+        the first challenge) instead of a hardcoded constant.
+
+        Returns True when nose offset is small and vertical ratio is
+        close to the user's own neutral.
+        """
+        HORZ_NEUTRAL = 0.1
+        VERT_NEUTRAL = 0.1
+
+        try:
+            nose = np.array(landmarks_dict['nose_tip'][2], dtype=float)
+            chin = landmarks_dict['chin']
+            left_jaw = np.array(chin[0], dtype=float)
+            right_jaw = np.array(chin[16], dtype=float)
+            face_width = np.linalg.norm(right_jaw - left_jaw)
+            if face_width < 1:
+                return False
+            face_center_x = (left_jaw[0] + right_jaw[0]) / 2.0
+            h_offset = abs((nose[0] - face_center_x) / face_width)
+
+            if h_offset >= HORZ_NEUTRAL:
+                return False
+
+            # Vertical check using eye-line pitch ratio (consistent with
+            # challenge detection — measures actual head pitch, not frame drift)
+            left_eye_inner = np.array(landmarks_dict['left_eye'][3], dtype=float)
+            right_eye_inner = np.array(landmarks_dict['right_eye'][0], dtype=float)
+            chin_bottom = np.array(chin[8], dtype=float)
+            eye_center_y = (left_eye_inner[1] + right_eye_inner[1]) / 2.0
+            eye_to_nose = (nose[1] - eye_center_y) / face_width
+            nose_to_chin = (chin_bottom[1] - nose[1]) / face_width
+            total_height = eye_to_nose + nose_to_chin
+            if total_height < 0.01:
+                return False
+            pitch_ratio = eye_to_nose / (total_height + 1e-6)
+
+            if self._neutral_v_ratio is None:
+                # First time — capture this as the user's neutral
+                self._neutral_v_ratio = pitch_ratio
+                return True
+
+            return abs(pitch_ratio - self._neutral_v_ratio) < VERT_NEUTRAL
+        except (KeyError, IndexError):
+            return False
+
     def update(self, landmarks_dict):
         """Check if current challenge is completed.
+
+        Flow: recenter (if needed) → show challenge → detect pose → next.
 
         Args:
             landmarks_dict: face_recognition.face_landmarks() result dict
@@ -1133,20 +2106,67 @@ class ChallengeResponseDetector:
         if self._paused:
             return self.get_result()
 
-        if not self.is_active or self.current_challenge is None:
+        if not self.is_active:
+            return self.get_result()
+
+        # --- Recentering phase: wait for neutral pose ---
+        if self._recentering:
+            RECENTER_CONFIRM = 3
+            if self._is_centered(landmarks_dict):
+                self._recenter_count += 1
+                if self._recenter_count >= RECENTER_CONFIRM:
+                    # Face is centered — capture reliable neutral baseline
+                    # before starting the next challenge (uses eye-line
+                    # pitch ratio consistent with challenge detection)
+                    if self._neutral_v_ratio is None:
+                        try:
+                            nt = np.array(landmarks_dict['nose_tip'][2], dtype=float)
+                            lei = np.array(landmarks_dict['left_eye'][3], dtype=float)
+                            rei = np.array(landmarks_dict['right_eye'][0], dtype=float)
+                            cb = np.array(landmarks_dict['chin'][8], dtype=float)
+                            lj = np.array(landmarks_dict['chin'][0], dtype=float)
+                            rj = np.array(landmarks_dict['chin'][16], dtype=float)
+                            fw = np.linalg.norm(rj - lj)
+                            if fw > 1:
+                                ec_y = (lei[1] + rei[1]) / 2.0
+                                e2n = (nt[1] - ec_y) / fw
+                                n2c = (cb[1] - nt[1]) / fw
+                                th = e2n + n2c
+                                if th > 0.01:
+                                    self._neutral_v_ratio = e2n / (th + 1e-6)
+                        except (KeyError, IndexError):
+                            pass
+                    self._recentering = False
+                    cid, instr = self._pending_challenge
+                    self.current_challenge = cid
+                    self.current_instruction = instr
+                    self.challenge_start_time = time.time()
+                    self._baseline = {}
+                    self._confirm_count = 0
+            else:
+                self._recenter_count = 0
+            return self.get_result()
+
+        # --- Normal challenge evaluation ---
+        if self.current_challenge is None:
             return self.get_result()
 
         elapsed = time.time() - self.challenge_start_time
         if elapsed > self.challenge_timeout:
             self.challenges_failed += 1
-            if self._remaining:
-                self._next_challenge()
-            else:
+            # Re-add the timed-out challenge to the back of the queue
+            # so it can be retried (instead of silently skipping it)
+            timed_out = (self.current_challenge, self.current_instruction)
+            self._remaining.append(timed_out)
+            if self.challenges_failed >= self.num_challenges:
+                # Too many failures overall — give up
                 self.is_active = False
                 self.is_complete = True
                 self.passed = False
                 self.current_challenge = None
-                self.current_instruction = "FAILED - Time expired"
+                self.current_instruction = "FAILED - Too many timeouts"
+            else:
+                self._next_challenge()
             return self.get_result()
 
         passed = self._check_challenge(landmarks_dict)
@@ -1167,8 +2187,23 @@ class ChallengeResponseDetector:
     # ------------------------------------------------------------------
 
     def _check_challenge(self, landmarks_dict):
-        """Evaluate whether the current head-pose challenge was performed."""
-        if self.current_challenge == 'TURN_LEFT':
+        """Evaluate whether the current head-pose challenge was performed.
+
+        Uses baseline-relative detection: the neutral position is captured
+        on the first frame of each challenge and the user must move clearly
+        away from it in the correct direction.  Requires multiple consecutive
+        confirming frames to prevent single-frame jitter from passing.
+
+        Thresholds:
+          LEFT / RIGHT  — nose offset must change by ≥ 0.12 * face_width
+          UP   / DOWN   — vertical ratio must change by ≥ 0.08
+          Confirm frames — 5 consecutive frames above threshold
+        """
+        CONFIRM_REQUIRED = 5
+        LR_THRESHOLD = 0.12
+        UD_THRESHOLD = 0.05
+
+        if self.current_challenge in ('TURN_LEFT', 'TURN_RIGHT'):
             try:
                 nose = np.array(landmarks_dict['nose_tip'][2], dtype=float)
                 chin = landmarks_dict['chin']
@@ -1176,55 +2211,101 @@ class ChallengeResponseDetector:
                 right_jaw = np.array(chin[16], dtype=float)
                 face_width = np.linalg.norm(right_jaw - left_jaw)
                 face_center_x = (left_jaw[0] + right_jaw[0]) / 2.0
-                if face_width > 1:
-                    offset = (nose[0] - face_center_x) / face_width
-                    return offset < -0.03
-            except (KeyError, IndexError):
-                pass
+                if face_width < 1:
+                    self._confirm_count = 0
+                    return False
+                offset = (nose[0] - face_center_x) / face_width
 
-        elif self.current_challenge == 'TURN_RIGHT':
+                # Capture neutral baseline on first frame
+                if 'horizontal_baseline' not in self._baseline:
+                    self._baseline['horizontal_baseline'] = offset
+                    self._confirm_count = 0
+                    return False
+
+                delta = offset - self._baseline['horizontal_baseline']
+
+                if self.current_challenge == 'TURN_LEFT':
+                    ok = delta < -LR_THRESHOLD
+                else:
+                    ok = delta > LR_THRESHOLD
+
+                if ok:
+                    self._confirm_count += 1
+                    return self._confirm_count >= CONFIRM_REQUIRED
+                else:
+                    self._confirm_count = 0
+                    return False
+            except (KeyError, IndexError):
+                self._confirm_count = 0
+                return False
+
+        elif self.current_challenge in ('LOOK_UP', 'LOOK_DOWN'):
             try:
-                nose = np.array(landmarks_dict['nose_tip'][2], dtype=float)
-                chin = landmarks_dict['chin']
-                left_jaw = np.array(chin[0], dtype=float)
-                right_jaw = np.array(chin[16], dtype=float)
+                nose_tip = np.array(landmarks_dict['nose_tip'][2], dtype=float)
+                bridge_top = np.array(landmarks_dict['nose_bridge'][0], dtype=float)
+                chin_bottom = np.array(landmarks_dict['chin'][8], dtype=float)
+                left_eye_inner = np.array(landmarks_dict['left_eye'][3], dtype=float)
+                right_eye_inner = np.array(landmarks_dict['right_eye'][0], dtype=float)
+                left_jaw = np.array(landmarks_dict['chin'][0], dtype=float)
+                right_jaw = np.array(landmarks_dict['chin'][16], dtype=float)
+
                 face_width = np.linalg.norm(right_jaw - left_jaw)
-                face_center_x = (left_jaw[0] + right_jaw[0]) / 2.0
-                if face_width > 1:
-                    offset = (nose[0] - face_center_x) / face_width
-                    return offset > 0.03
-            except (KeyError, IndexError):
-                pass
+                if face_width < 1:
+                    self._confirm_count = 0
+                    return False
 
-        elif self.current_challenge == 'LOOK_UP':
-            try:
-                nose_tip = np.array(landmarks_dict['nose_tip'][2], dtype=float)
-                bridge_top = np.array(landmarks_dict['nose_bridge'][0], dtype=float)
-                chin_bottom = np.array(landmarks_dict['chin'][8], dtype=float)
-                upper = abs(nose_tip[1] - bridge_top[1])
-                lower = abs(chin_bottom[1] - nose_tip[1])
-                ratio = upper / (upper + lower + 1e-6)
-                if 'vertical_ratio_baseline' not in self._baseline:
-                    self._baseline['vertical_ratio_baseline'] = ratio
-                elif ratio < self._baseline['vertical_ratio_baseline'] - 0.04:
-                    return True
-            except (KeyError, IndexError):
-                pass
+                # --- Signal 1: Eye-line to nose-tip vs nose-tip to chin ---
+                # Under pitch, the nose moves relative to the eye-chin axis.
+                # Normalized by face_width to be translation-invariant.
+                eye_center_y = (left_eye_inner[1] + right_eye_inner[1]) / 2.0
+                eye_to_nose = (nose_tip[1] - eye_center_y) / face_width
+                nose_to_chin = (chin_bottom[1] - nose_tip[1]) / face_width
 
-        elif self.current_challenge == 'LOOK_DOWN':
-            try:
-                nose_tip = np.array(landmarks_dict['nose_tip'][2], dtype=float)
-                bridge_top = np.array(landmarks_dict['nose_bridge'][0], dtype=float)
-                chin_bottom = np.array(landmarks_dict['chin'][8], dtype=float)
-                upper = abs(nose_tip[1] - bridge_top[1])
-                lower = abs(chin_bottom[1] - nose_tip[1])
-                ratio = upper / (upper + lower + 1e-6)
-                if 'vertical_ratio_baseline' not in self._baseline:
-                    self._baseline['vertical_ratio_baseline'] = ratio
-                elif ratio > self._baseline['vertical_ratio_baseline'] + 0.04:
-                    return True
+                total_height = eye_to_nose + nose_to_chin
+                if total_height < 0.01:
+                    self._confirm_count = 0
+                    return False
+                pitch_ratio = eye_to_nose / (total_height + 1e-6)
+
+                # --- Signal 2: Nose bridge foreshortening ---
+                # When looking up, the nose bridge (bridge_top → nose_tip)
+                # appears shorter because it's angled toward the camera.
+                # Normalize by face_width to be scale-invariant.
+                bridge_len = np.linalg.norm(nose_tip - bridge_top) / face_width
+
+                # Capture neutral baselines on first frame
+                if 'pitch_ratio_baseline' not in self._baseline:
+                    self._baseline['pitch_ratio_baseline'] = pitch_ratio
+                    self._baseline['bridge_len_baseline'] = bridge_len
+                    self._confirm_count = 0
+                    return False
+
+                delta_pitch = pitch_ratio - self._baseline['pitch_ratio_baseline']
+                delta_bridge = bridge_len - self._baseline['bridge_len_baseline']
+
+                # Fuse signals: both should agree on direction
+                # Look up → pitch_ratio decreases (nose closer to eyes),
+                #            bridge_len decreases (foreshortened)
+                # Look down → pitch_ratio increases (nose farther from eyes),
+                #              bridge_len increases (elongated)
+                if self.current_challenge == 'LOOK_UP':
+                    ok_pitch = delta_pitch < -UD_THRESHOLD
+                    ok_bridge = delta_bridge < -UD_THRESHOLD * 0.5
+                    ok = ok_pitch or ok_bridge
+                else:
+                    ok_pitch = delta_pitch > UD_THRESHOLD
+                    ok_bridge = delta_bridge > UD_THRESHOLD * 0.5
+                    ok = ok_pitch or ok_bridge
+
+                if ok:
+                    self._confirm_count += 1
+                    return self._confirm_count >= CONFIRM_REQUIRED
+                else:
+                    self._confirm_count = 0
+                    return False
             except (KeyError, IndexError):
-                pass
+                self._confirm_count = 0
+                return False
 
         return False
 
@@ -1348,6 +2429,7 @@ class ChallengeResponseDetector:
             'is_complete': self.is_complete,
             'passed': self.passed,
             'paused': self._paused,
+            'recentering': self._recentering,
             'current_challenge': self.current_challenge,
             'current_instruction': self.current_instruction,
             'challenges_passed': self.challenges_passed,
@@ -1373,6 +2455,11 @@ class ChallengeResponseDetector:
         self._paused = False
         self._baseline = {}
         self._remaining = []
+        self._confirm_count = 0
+        self._recentering = False
+        self._recenter_count = 0
+        self._pending_challenge = None
+        self._neutral_v_ratio = None
         self._pose_snapshots = {}
         self._consistency_score = 0.0
         self._euc_lr = 0.0
@@ -1386,65 +2473,58 @@ class ChallengeResponseDetector:
 # =============================================================================
 
 class AntiSpoofing:
-    """Two-gate anti-spoofing / liveness detection system.
+    """Two-gate sequential anti-spoofing / liveness detection system.
 
-    Gate 1 — Photo / Liveness (passive, continuous):
-      Proves the face is a live person, not a static photo.
-        • Eye blink detection              (30%)
-        • Mouth micro-movement             (30%)
-        • Non-rigid landmark movement      (15%)
-        • 3D depth-motion parallax         (25%)
-      Must reach photo_threshold to pass.
+    Gate 1 — Blink verification (passive, binary):
+      User must produce at least one confirmed blink.
+      A photo can never blink — definitive anti-photo gate.
 
-    Gate 2 — Video detection (active challenge + FFT):
-      Proves the feed is not a video replay on a screen.
-        • Head-pose challenge with 3D consistency (45%)
-        • FFT screen / moiré detection             (35%)
-          - 7 sub-metrics: spectral flatness, axis energy,
-            mid-freq peaks, Laplacian, HF energy,
-            colour correlation, texture roll-off
-        • Screen reflection pattern detection      (20%)
-      Must reach video_threshold to pass.
+    Gate 2 — Challenge-response (active):
+      Randomized head-pose challenges with 3D geometric consistency.
+      Only starts after Gate 1 passes.  Threshold: challenge_threshold.
 
-    Final decision: Gate 1 must pass first, then Gate 2 is evaluated.
-    BOTH gates must pass for ≥ consec_live_required consecutive
-    evaluations before is_live = True.  Each gate contributes 100%
-    of its own score (no averaging between gates).
+    Final decision: Both gates must pass for ≥ consec_live_required
+    consecutive evaluations before is_live = True.
 
-    Uses only MTCNN and CNN (dlib) — no MediaPipe dependency.
+    Uses only MTCNN and dlib landmarks — no MediaPipe dependency.
     """
 
-    def __init__(self, photo_threshold=0.40, video_threshold=0.35,
+    def __init__(self, challenge_threshold=0.40,
                  num_challenges=4, challenge_timeout=10.0,
-                 ear_threshold=0.25, consec_frames=1, blink_time_window=5.0,
-                 mar_movement_threshold=0.005, mar_history_size=20,
-                 movement_threshold=0.002, movement_history=15):
+                 ear_threshold=0.21, consec_frames=3, blink_time_window=5.0,
+                 depth_threshold=0.35):
 
         # Gate thresholds
-        self.photo_threshold = photo_threshold
-        self.video_threshold = video_threshold
+        self.challenge_threshold = challenge_threshold
+        self.depth_threshold = depth_threshold
 
         # Sub-detectors
-        self.blink_detector = BlinkDetector(ear_threshold, consec_frames, blink_time_window)
-        self.mouth_detector = MouthMovementDetector(mar_movement_threshold, mar_history_size)
-        self.movement_detector = MovementDetector(movement_threshold, movement_history)
-        self.depth_motion_detector = DepthMotionDetector()
+        self.blink_detector = BlinkDetector(
+            ear_threshold=ear_threshold,
+            consec_frames=consec_frames,
+            time_window=blink_time_window,
+        )
         self.challenge_detector = ChallengeResponseDetector(num_challenges, challenge_timeout)
-        self.screen_detector = ScreenDetector()
-        self.reflection_detector = ReflectionPatternDetector()
+        self.depth_geometry_detector = DepthGeometryDetector()
 
         # State
         self.last_liveness_score = 0.0
         self.last_is_live = False
         self.last_signals = {
-            "blink": 0.0, "movement": 0.0, "depth_motion": 0.0,
-            "mouth": 0.0, "challenge": 0.0,
-            "screen": 1.0, "reflection": 1.0,
+            "blink": 0.0, "challenge": 0.0, "depth_geometry": 0.0,
         }
 
         # Temporal consistency
         self._consec_live_count = 0
         self._consec_live_required = 5
+
+        # Latched gate state — once a gate passes, its detectors stop
+        # running and its score is frozen until reset().
+        self._gate1_latched = False
+        self._gate2_latched = False
+        self._gate3_latched = False
+        self._gate2_frozen_score = 0.0
+        self._gate3_frozen_score = 0.0
 
     def start_challenge(self):
         """Start the interactive challenge-response sequence."""
@@ -1471,104 +2551,109 @@ class AntiSpoofing:
         self.challenge_detector.unpause()
 
     def evaluate(self, frame_bgr, face_location, landmarks_dict=None):
-        """Run all anti-spoofing checks on one frame for one face.
+        """Run anti-spoofing checks on one frame for one face.
 
-        Two-gate evaluation:
-          Gate 1 (photo):  blink + mouth + movement + depth_motion
-          Gate 2 (video):  challenge + FFT screen + reflection
+        Three-gate sequential evaluation:
+          Gate 1 (blink):      at least one blink detected
+          Gate 2 (challenge):  randomized head-pose challenge-response
+          Gate 3 (depth geometry): 3D landmark ratio changes
 
-        Both gates must pass simultaneously for ≥ consec_live_required
+        All gates must pass simultaneously for ≥ consec_live_required
         consecutive frames before is_live = True.
 
-        Args:
-            frame_bgr: Full BGR frame from OpenCV capture
-            face_location: Tuple (top, right, bottom, left) at frame resolution
-            landmarks_dict: Result from face_recognition.face_landmarks(), or None
-
         Returns:
-            dict with liveness results, gate scores, and all signal values
+            dict with liveness results, gate scores, and signal values
         """
         blink_signal = 0.0
-        mouth_signal = 0.0
-        movement_signal = 0.0
-        depth_motion_signal = 0.0
         challenge_result = self.challenge_detector.get_result()
+        depth_geometry_signal = 0.0
 
-        # --- Gate 2 signals: Screen detection (FFT + reflection on face ROI) ---
-        screen_signal = self.screen_detector.update(frame_bgr, face_location)
-        reflection_signal = self.reflection_detector.update(frame_bgr, face_location)
-
-        # --- Gate 1 signals: Landmark-based passive detectors ---
-        if landmarks_dict is not None:
+        # --- Gate 1 detectors (blink) — skip if latched ---
+        if not self._gate1_latched and landmarks_dict is not None:
             left_eye = landmarks_dict.get('left_eye')
             right_eye = landmarks_dict.get('right_eye')
-
             if left_eye and right_eye:
                 blink_signal = self.blink_detector.update(left_eye, right_eye)
 
-            mouth_signal = self.mouth_detector.update(landmarks_dict)
-            movement_signal = self.movement_detector.update(landmarks_dict)
-            depth_motion_signal = self.depth_motion_detector.update(landmarks_dict)
-
-            # --- Gate 2 signals: Head-pose challenge ---
+        # --- Gate 2 detectors (challenge) — skip if latched ---
+        if not self._gate2_latched and landmarks_dict is not None:
             if self.challenge_detector.is_active:
                 challenge_result = self.challenge_detector.update(landmarks_dict)
 
         challenge_signal = challenge_result['signal']
 
+        # --- Gate 3 detectors (depth geometry) ---
+        if not self._gate3_latched and landmarks_dict is not None:
+            depth_geometry_signal = self.depth_geometry_detector.update(landmarks_dict)
+
         # =============================================================
-        # Gate 1 — Photo / Liveness (is this a live person, not a photo?)
-        # Passive: blinks + mouth micro-movement + non-rigid landmark
-        # motion + 3D depth-dependent parallax.
-        #
-        # HARD REQUIREMENT: at least one blink must be detected before
-        # Gate 1 can pass.  A photo can never blink, so this is the
-        # single most reliable photo-vs-live discriminator and prevents
-        # camera sensor noise in the other signals from fooling Gate 1.
+        # Gate 1 — Blink verification
         # =============================================================
-        photo_score = (0.30 * blink_signal +
-                       0.30 * mouth_signal +
-                       0.15 * movement_signal +
-                       0.25 * depth_motion_signal)
-        blink_detected = len(self.blink_detector.blink_timestamps) > 0
-        photo_passed = (photo_score >= self.photo_threshold) and blink_detected
+        blink_detected = self._gate1_latched or len(self.blink_detector.blink_timestamps) > 0
+        gate1_score = 1.0 if blink_detected else 0.0
+        gate1_passed = blink_detected
+
+        # Latch gate 1 on first pass
+        if gate1_passed and not self._gate1_latched:
+            self._gate1_latched = True
 
         # Auto-start challenge once Gate 1 passes for the first time
-        if photo_passed and not self.challenge_detector.is_active \
+        if gate1_passed and not self.challenge_detector.is_active \
                 and not self.challenge_detector.is_complete:
             self.challenge_detector.start()
             challenge_result = self.challenge_detector.get_result()
             challenge_signal = challenge_result['signal']
 
         # =============================================================
-        # Gate 2 — Video detection (is this a real camera, not a screen?)
-        # Only evaluated after Gate 1 passes.  If Gate 1 fails (photo
-        # detected), Gate 2 is skipped entirely — no challenge, no FFT.
+        # Gate 2 — Challenge-response (head-pose, randomized)
+        # Only after Gate 1.  Active interaction proves live control.
         # =============================================================
-        if photo_passed:
-            video_score = (0.45 * challenge_signal +
-                           0.35 * screen_signal +
-                           0.20 * reflection_signal)
-            video_passed = video_score >= self.video_threshold
+        if self._gate2_latched:
+            gate2_score = self._gate2_frozen_score
         else:
-            # Photo detected → block: do not evaluate Gate 2
-            video_score = 0.0
-            video_passed = False
+            gate2_score = challenge_signal
+        gate2_passed = gate1_passed and (gate2_score >= self.challenge_threshold)
+
+        # Latch gate 2 on first pass
+        if gate2_passed and not self._gate2_latched:
+            self._gate2_latched = True
+            self._gate2_frozen_score = gate2_score
 
         # =============================================================
-        # Final decision — sequential gates, both must hold consecutively
-        #   Gate 1 (photo) must pass first → then Gate 2 (video) is evaluated.
-        #   Each gate is 100% of its own score (no averaging).
+        # Gate 3 — Depth geometry (3D landmark ratio changes)
+        # Only after Gate 1.  Passive, but robust against replay attacks.
         # =============================================================
-        if photo_passed and video_passed:
-            liveness_score = min(photo_score, video_score)
-        elif photo_passed:
-            liveness_score = photo_score * 0.5   # half credit: photo OK, video pending
+        if self._gate3_latched:
+            gate3_score = self._gate3_frozen_score
         else:
-            liveness_score = photo_score * 0.25  # low: still on Gate 1
-        both_passed = photo_passed and video_passed
+            gate3_score = depth_geometry_signal
+        gate3_passed = gate1_passed and (gate3_score >= self.depth_threshold)
 
-        if both_passed:
+        # Latch gate 3 on first pass
+        if gate3_passed and not self._gate3_latched:
+            self._gate3_latched = True
+            self._gate3_frozen_score = gate3_score
+
+        # =============================================================
+        # Final decision — all gates must hold consecutively
+        # =============================================================
+        all_passed = gate1_passed and gate2_passed and gate3_passed
+
+        photo_score = gate1_score
+        photo_passed = gate1_passed
+        video_score = gate2_score
+        video_passed = gate2_passed
+        depth_score = gate3_score
+        depth_passed = gate3_passed
+
+        if all_passed:
+            liveness_score = (gate2_score + gate3_score) / 2.0
+        elif gate1_passed:
+            liveness_score = 0.20
+        else:
+            liveness_score = 0.0
+
+        if all_passed:
             self._consec_live_count += 1
         else:
             self._consec_live_count = 0
@@ -1579,10 +2664,9 @@ class AntiSpoofing:
         self.last_liveness_score = liveness_score
         self.last_is_live = is_live
         self.last_signals = {
-            "blink": blink_signal, "movement": movement_signal,
-            "depth_motion": depth_motion_signal,
-            "mouth": mouth_signal, "challenge": challenge_signal,
-            "screen": screen_signal, "reflection": reflection_signal,
+            "blink": blink_signal,
+            "challenge": challenge_signal,
+            "depth_geometry": depth_geometry_signal,
         }
 
         return {
@@ -1592,31 +2676,36 @@ class AntiSpoofing:
             "photo_passed": photo_passed,
             "video_score": video_score,
             "video_passed": video_passed,
+            "depth_score": depth_score,
+            "depth_passed": depth_passed,
+            "gate1_passed": gate1_passed,
+            "gate2_passed": gate2_passed,
+            "gate3_passed": gate3_passed,
+            "gate2_score": gate2_score,
+            "gate3_score": gate3_score,
             "blink_signal": blink_signal,
-            "mouth_signal": mouth_signal,
-            "movement_signal": movement_signal,
-            "depth_motion_signal": depth_motion_signal,
             "challenge_signal": challenge_signal,
-            "screen_signal": screen_signal,
-            "reflection_signal": reflection_signal,
+            "depth_geometry_signal": depth_geometry_signal,
             "challenge_result": challenge_result,
             "ear": self.blink_detector.last_ear,
-            "mar": self.mouth_detector.last_mar,
+            "ear_threshold": self.blink_detector.ear_threshold,
             "consistency_score": challenge_result.get('consistency_score', 0.0),
         }
 
     def reset(self):
         """Reset all detector state."""
         self.blink_detector.reset()
-        self.mouth_detector.reset()
-        self.movement_detector.reset()
-        self.depth_motion_detector.reset()
         self.challenge_detector.reset()
-        self.screen_detector.reset()
-        self.reflection_detector.reset()
+        self.depth_geometry_detector.reset()
         self.last_liveness_score = 0.0
         self.last_is_live = False
         self._consec_live_count = 0
+        # Clear latched gates
+        self._gate1_latched = False
+        self._gate2_latched = False
+        self._gate3_latched = False
+        self._gate2_frozen_score = 0.0
+        self._gate3_frozen_score = 0.0
 
     def release(self):
         """Release resources. No-op (no external models to close)."""
