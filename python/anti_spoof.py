@@ -12,8 +12,6 @@ import time
 import random
 import numpy as np
 import cv2
-import face_recognition
-
 
 # =============================================================================
 # Blink Detector (dlib 68-point EAR)
@@ -2053,8 +2051,8 @@ class ChallengeResponseDetector:
         Returns True when nose offset is small and vertical ratio is
         close to the user's own neutral.
         """
-        HORZ_NEUTRAL = 0.1
-        VERT_NEUTRAL = 0.1
+        HORZ_NEUTRAL = 0.15
+        VERT_NEUTRAL = 0.15
 
         try:
             nose = np.array(landmarks_dict['nose_tip'][2], dtype=float)

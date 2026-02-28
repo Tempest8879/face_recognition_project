@@ -13,8 +13,8 @@ Dependencies: facenet-pytorch, onnxruntime, face_recognition,
               torch, opencv-python, numpy
 
 ArcFace model:
-  Place an ArcFace ONNX model (e.g. w600k_r50.onnx) in the models/ directory.
-  Download from: https://github.com/deepinsight/insightface/tree/master/model_zoo
+  Place the ArcFace ONNX model (w600k_r50.onnx) in the models/ directory.
+  Download from: https://drive.google.com/file/d/15wKZ9Ub03B_24lxmGMQG-wHtaI0Et88W/view?usp=drive_link
 """
 
 import os
