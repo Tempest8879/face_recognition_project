@@ -31,19 +31,18 @@ Dependencies:
   (or onnxruntime-gpu for CUDA acceleration)
 
 ArcFace Model:
-  Run the download script:
-    python download_model.py
+  Get from my gdrive:
+    https://drive.google.com/file/d/15wKZ9Ub03B_24lxmGMQG-wHtaI0Et88W/view?usp=drive_link
   Or manually download an ArcFace ONNX model and place it in models/:
     https://github.com/deepinsight/insightface/tree/master/model_zoo
   Recommended: w600k_r50.onnx (buffalo_l recognition model)
   The app auto-discovers the first .onnx file in models/
 
 Quick Start:
-  1. Download the model:       python download_model.py
+  1. Download the model:       https://drive.google.com/file/d/15wKZ9Ub03B_24lxmGMQG-wHtaI0Et88W/view?usp=drive_link
   2. Build the C++ module:     build.bat
   2. Test the setup:           python python/test_setup.py
   3. Run with webcam:          python python/face_recognition_app.py
-  4. Run on an image:          python python/face_recognition_app.py path/to/image.jpg
 
 Adding Known Faces:
   Put photos in data/known_faces/ named after the person:
