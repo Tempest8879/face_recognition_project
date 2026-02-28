@@ -11,29 +11,15 @@ namespace py = pybind11;
 PYBIND11_MODULE(face_processor_cpp, m) {
     m.doc() = "C++ Face Processor - high-performance face recognition backend";
 
-    // Expose FaceLocation struct
-    py::class_<FaceLocation>(m, "FaceLocation")
-        .def(py::init<>())
-        .def_readwrite("top", &FaceLocation::top)
-        .def_readwrite("right", &FaceLocation::right)
-        .def_readwrite("bottom", &FaceLocation::bottom)
-        .def_readwrite("left", &FaceLocation::left)
-        .def("__repr__", [](const FaceLocation& fl) {
-            return "FaceLocation(top=" + std::to_string(fl.top) +
-                   ", right=" + std::to_string(fl.right) +
-                   ", bottom=" + std::to_string(fl.bottom) +
-                   ", left=" + std::to_string(fl.left) + ")";
-        });
-
     // Expose FaceMatch struct
     py::class_<FaceMatch>(m, "FaceMatch")
         .def(py::init<>())
         .def_readwrite("name", &FaceMatch::name)
-        .def_readwrite("distance", &FaceMatch::distance)
+        .def_readwrite("similarity", &FaceMatch::similarity)
         .def_readwrite("confidence", &FaceMatch::confidence)
         .def("__repr__", [](const FaceMatch& fm) {
             return "FaceMatch(name='" + fm.name +
-                   "', distance=" + std::to_string(fm.distance) +
+                   "', similarity=" + std::to_string(fm.similarity) +
                    ", confidence=" + std::to_string(fm.confidence) + ")";
         });
 
@@ -42,20 +28,20 @@ PYBIND11_MODULE(face_processor_cpp, m) {
         .def(py::init<>())
         .def("add_known_face", &FaceProcessor::add_known_face,
              py::arg("name"), py::arg("encoding"),
-             "Register a known face with a name and 128-dim encoding vector")
+             "Register a known face with a name and encoding vector")
         .def("find_best_match", &FaceProcessor::find_best_match,
-             py::arg("unknown_encoding"), py::arg("tolerance") = 0.6,
-             "Find the closest matching known face for an unknown encoding")
+             py::arg("unknown_encoding"), py::arg("threshold") = 0.4,
+             "Find the best matching known face using cosine similarity")
         .def("find_matches_batch", &FaceProcessor::find_matches_batch,
-             py::arg("unknown_encodings"), py::arg("tolerance") = 0.6,
-             "Match multiple unknown faces in batch (faster)")
+             py::arg("unknown_encodings"), py::arg("threshold") = 0.4,
+             "Match multiple unknown faces in batch using cosine similarity")
         .def("known_face_count", &FaceProcessor::known_face_count,
              "Get the number of registered known faces")
         .def("clear_known_faces", &FaceProcessor::clear_known_faces,
              "Remove all known faces")
-        .def_static("euclidean_distance", &FaceProcessor::euclidean_distance,
+        .def_static("cosine_similarity", &FaceProcessor::cosine_similarity,
                      py::arg("a"), py::arg("b"),
-                     "Compute Euclidean distance between two 128-dim encodings");
+                     "Compute cosine similarity between two encoding vectors");
 
     // ========================================================================
     // Anti-Spoofing: Texture Analyzer (LBP-based)

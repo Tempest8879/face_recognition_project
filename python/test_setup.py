@@ -31,6 +31,7 @@ def main():
     results.append(test_import("dlib", "dlib"))
     results.append(test_import("face_recognition", "face_recognition"))
     results.append(test_import("pybind11", "pybind11"))
+    results.append(test_import("onnxruntime", "ONNX Runtime"))
 
     # C++ module
     print("\n2. C++ Backend Module:")
@@ -45,7 +46,7 @@ def main():
 
             fake_encoding_1 = [0.1] * 128
             fake_encoding_2 = [0.1001] * 128
-            fake_encoding_3 = [0.9] * 128
+            fake_encoding_3 = [0.9] * 64 + [-0.9] * 64
 
             proc.add_known_face("TestPerson", fake_encoding_1)
             assert proc.known_face_count() == 1
@@ -63,10 +64,16 @@ def main():
             assert len(batch) == 2
             print(f"  [PASS] find_matches_batch -> {len(batch)} results")
 
-            dist = face_processor_cpp.FaceProcessor.euclidean_distance(
+            sim = face_processor_cpp.FaceProcessor.cosine_similarity(
+                fake_encoding_1, fake_encoding_2
+            )
+            assert sim > 0.99
+            print(f"  [PASS] cosine_similarity (similar) -> {sim:.4f}")
+
+            sim2 = face_processor_cpp.FaceProcessor.cosine_similarity(
                 fake_encoding_1, fake_encoding_3
             )
-            print(f"  [PASS] euclidean_distance -> {dist:.4f}")
+            print(f"  [PASS] cosine_similarity (different) -> {sim2:.4f}")
 
             proc.clear_known_faces()
             assert proc.known_face_count() == 0
@@ -114,9 +121,10 @@ def main():
     print("\n5. Anti-Spoofing Module Test:")
     try:
         from anti_spoof import (
-            AntiSpoofing, BlinkDetector, MovementDetector,
+            AntiSpoofing, BlinkDetector,
             MouthMovementDetector, ChallengeResponseDetector,
-            ScreenDetector
+            ScreenDetector, ScreenEdgeDetector,
+            OpticalFlowDetector, DepthGeometryDetector
         )
         print(f"  [PASS] anti_spoof module imports successfully")
 
@@ -130,8 +138,8 @@ def main():
         assert bd.last_ear > 0
         print(f"  [PASS] BlinkDetector.update -> signal={signal:.2f}, EAR={bd.last_ear:.2f}")
 
-        # Test MovementDetector with synthetic dlib landmarks dict
-        md = MovementDetector()
+        # Test MouthMovementDetector
+        mmd = MouthMovementDetector()
         fake_lm = {
             'nose_tip': [(100, 150), (102, 150), (104, 150), (106, 150), (108, 150)],
             'chin': [(50, 200)] * 9 + [(150, 200)] * 8,
@@ -139,12 +147,6 @@ def main():
             'right_eye': [(120, 120)] * 4,
             'nose_bridge': [(100, 100)] * 4,
         }
-        signal = md.update(fake_lm)
-        assert 0.0 <= signal <= 1.0
-        print(f"  [PASS] MovementDetector.update -> signal={signal:.2f}")
-
-        # Test MouthMovementDetector
-        mmd = MouthMovementDetector()
         fake_lm['top_lip'] = [(80, 160), (85, 158), (90, 156), (100, 155),
                               (110, 156), (115, 158), (120, 160),
                               (115, 162), (110, 163), (100, 164), (90, 163)]
@@ -226,7 +228,7 @@ def main():
     mtcnn_ok = test_import("facenet_pytorch", "facenet-pytorch (MTCNN)")
     if not mtcnn_ok:
         print("  [INFO] MTCNN not installed. Install with: pip install facenet-pytorch")
-        print("         The system will fall back to dlib CNN face detection.")
+        print("         MTCNN is required for face detection.")
 
     # Summary
     print("\n" + "=" * 60)
