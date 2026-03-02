@@ -27,6 +27,15 @@ import numpy as np
 import cv2
 import face_recognition
 
+# Ensure CUDA libraries are discoverable before importing onnxruntime
+_cuda_bin = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin"
+if os.path.isdir(_cuda_bin):
+    if _cuda_bin not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _cuda_bin + os.pathsep + os.environ.get("PATH", "")
+    # Windows 10+ / Python 3.8+: required for DLL search
+    if hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(_cuda_bin)
+
 # MTCNN for face detection (required)
 try:
     from facenet_pytorch import MTCNN as MTCNNDetector
@@ -106,15 +115,33 @@ class FaceRecognitionApp:
             model_path = self._find_arcface_model()
             if model_path:
                 try:
-                    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-                    self.ort_session = ort.InferenceSession(model_path, providers=providers)
+                    # Try GPU first, fall back to CPU if CUDA libs are missing
+                    available = ort.get_available_providers()
+                    self.ort_session = None
+                    if 'CUDAExecutionProvider' in available:
+                        try:
+                            self.ort_session = ort.InferenceSession(
+                                model_path, providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+                            )
+                            # Verify CUDA actually loaded (not just listed)
+                            if 'CUDAExecutionProvider' not in self.ort_session.get_providers():
+                                self.ort_session = None
+                        except Exception:
+                            print("[WARNING] CUDA provider listed but failed to load (missing CUDA/cuDNN libs).")
+                            print("          Falling back to CPU.")
+                            self.ort_session = None
+                    if self.ort_session is None:
+                        self.ort_session = ort.InferenceSession(
+                            model_path, providers=['CPUExecutionProvider']
+                        )
                     self.arcface_input_name = self.ort_session.get_inputs()[0].name
                     input_shape = self.ort_session.get_inputs()[0].shape
                     if len(input_shape) == 4:
                         self.arcface_input_size = (input_shape[2], input_shape[3])
                     active = self.ort_session.get_providers()
+                    provider_label = "GPU (CUDA)" if 'CUDAExecutionProvider' in active else "CPU"
                     print(f"[OK] ArcFace ONNX model loaded: {os.path.basename(model_path)}")
-                    print(f"     Input: {self.arcface_input_name} {input_shape}, Provider: {active[0]}")
+                    print(f"     Input: {self.arcface_input_name} {input_shape}, Provider: {provider_label}")
                     self.use_arcface = True
                 except Exception as e:
                     print(f"[WARNING] ArcFace ONNX init failed: {e}")
@@ -476,7 +503,6 @@ class FaceRecognitionApp:
 
         # --- Display state (main thread only) ---
         display_boxes = []
-        target_boxes = []
         display_matches = []
         display_spoof = None
         display_is_live = True

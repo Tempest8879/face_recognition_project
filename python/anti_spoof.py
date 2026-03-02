@@ -2052,7 +2052,7 @@ class ChallengeResponseDetector:
         close to the user's own neutral.
         """
         HORZ_NEUTRAL = 0.15
-        VERT_NEUTRAL = 0.15
+        VERT_NEUTRAL = 0.10
 
         try:
             nose = np.array(landmarks_dict['nose_tip'][2], dtype=float)
