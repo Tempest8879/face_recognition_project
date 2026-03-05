@@ -1,0 +1,39 @@
+services:
+  # CPU deployment (default)
+  face-recognition-cpu:
+    build:
+      context: .
+      args:
+        BASE_IMAGE: ubuntu:22.04
+        ONNX_PKG: onnxruntime
+    image: face-recognition:cpu
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+    profiles:
+      - cpu
+
+  # GPU deployment (requires nvidia-container-toolkit on host)
+  face-recognition-gpu:
+    build:
+      context: .
+      args:
+        BASE_IMAGE: nvidia/cuda:12.6.0-runtime-ubuntu22.04
+        ONNX_PKG: onnxruntime-gpu
+    image: face-recognition:gpu
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles:
+      - gpu

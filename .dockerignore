@@ -1,0 +1,12 @@
+.git
+.gitignore
+.vscode
+__pycache__
+*.pyc
+*.pyd
+*.lib
+*.exp
+*.obj
+*.bat
+models/
+.claude

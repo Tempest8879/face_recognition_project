@@ -1,0 +1,15 @@
+# Default: normalize all text files to LF
+# LF works on both Windows and Linux — no issues
+* text=auto eol=lf
+
+# Windows batch files are the only exception — they require CRLF
+*.bat eol=crlf
+
+# Binary files (don't touch)
+*.onnx binary
+*.pyd binary
+*.lib binary
+*.exp binary
+*.pyc binary
+*.jpg binary
+*.png binary

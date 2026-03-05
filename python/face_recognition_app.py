@@ -28,13 +28,18 @@ import cv2
 import face_recognition
 
 # Ensure CUDA libraries are discoverable before importing onnxruntime
-_cuda_bin = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin"
-if os.path.isdir(_cuda_bin):
-    if _cuda_bin not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = _cuda_bin + os.pathsep + os.environ.get("PATH", "")
-    # Windows 10+ / Python 3.8+: required for DLL search
-    if hasattr(os, "add_dll_directory"):
-        os.add_dll_directory(_cuda_bin)
+_cuda_paths = [
+    r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin",  # Windows
+    "/usr/local/cuda/lib64",                                           # Linux
+    "/usr/local/cuda/bin",                                             # Linux
+]
+for _cuda_bin in _cuda_paths:
+    if os.path.isdir(_cuda_bin):
+        if _cuda_bin not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = _cuda_bin + os.pathsep + os.environ.get("PATH", "")
+        # Windows 10+ / Python 3.8+: required for DLL search
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(_cuda_bin)
 
 # MTCNN for face detection (required)
 try:

@@ -49,3 +49,24 @@ Adding Known Faces:
     - john.jpg
     - alice.png
   Each image should contain exactly one face.
+
+
+FOR LINUX INSTALLATION:
+
+# If run with CPU...
+docker compose --profile cpu up --build
+
+# Else GPU (only with NVIDIA GPU + nvidia-container-toolkit)
+docker compose --profile gpu up --build
+
+To Verify if Working:
+
+# Health check
+curl http://localhost:8000/health
+
+# Recognize a face in an image
+curl -X POST -F "file=@some_photo.jpg" http://localhost:8000/recognize
+
+# Register a new face
+curl -X POST -F "name=John" -F "file=@john_face.jpg" http://localhost:8000/register
+
